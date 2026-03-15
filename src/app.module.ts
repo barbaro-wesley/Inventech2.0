@@ -4,6 +4,8 @@ import { APP_GUARD, APP_FILTER } from '@nestjs/core'
 import { PrismaModule } from './prisma/prisma.module'
 import { AuthModule } from './modules/auth/auth.module'
 import { UsersModule } from './modules/users/users.module'
+import { EquipmentModule } from './modules/equipment/equipment.module'
+import { ServiceOrdersModule } from './modules/service-orders/service-orders.module'
 import { CompaniesModule } from './modules/companies/companies.module'
 import { ClientsModule } from './modules/clients/clients.module'
 import { JwtAuthGuard } from './modules/auth/guards/jwt-auth.guard'
@@ -23,8 +25,8 @@ import { GlobalExceptionFilter } from './common/filters/http-exception.filter'
     UsersModule,
     CompaniesModule,
     ClientsModule,
-    // EquipmentModule,
-    // ServiceOrdersModule,
+    EquipmentModule,
+    ServiceOrdersModule,
     // MaintenanceModule,
     // NotificationsModule,
     // StorageModule,
@@ -48,4 +50,4 @@ import { GlobalExceptionFilter } from './common/filters/http-exception.filter'
     },
   ],
 })
-export class AppModule {}
+export class AppModule { }
