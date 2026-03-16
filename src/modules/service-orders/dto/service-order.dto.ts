@@ -3,7 +3,12 @@ import {
     IsUUID, Max, Min,
 } from 'class-validator'
 import { Type } from 'class-transformer'
-import { ServiceOrderPriority, ServiceOrderStatus } from '@prisma/client'
+import {
+    MaintenanceType,
+    ServiceOrderPriority,
+    ServiceOrderStatus,
+    ServiceOrderTechnicianRole,
+} from '@prisma/client'
 
 export class CreateServiceOrderDto {
     @IsUUID()
@@ -15,17 +20,32 @@ export class CreateServiceOrderDto {
     @IsString()
     description: string
 
+    @IsEnum(MaintenanceType)
+    maintenanceType: MaintenanceType  // Preventiva, Corretiva etc.
+
     @IsOptional()
     @IsEnum(ServiceOrderPriority)
     priority?: ServiceOrderPriority = ServiceOrderPriority.MEDIUM
 
+    // Grupo responsável (Elétrica, Hidráulica, Predial...)
+    @IsOptional()
+    @IsUUID()
+    groupId?: string
+
+    // Técnico é opcional — se não informar, vai para o painel
     @IsOptional()
     @IsUUID()
     technicianId?: string
 
     @IsOptional()
     @IsString()
-    scheduledFor?: string  // ISO date string
+    scheduledFor?: string
+
+    // Horas sem assumir antes de disparar alerta (padrão: 2h)
+    @IsOptional()
+    @IsInt()
+    @Min(1)
+    alertAfterHours?: number
 }
 
 export class UpdateServiceOrderDto {
@@ -43,7 +63,7 @@ export class UpdateServiceOrderDto {
 
     @IsOptional()
     @IsUUID()
-    technicianId?: string
+    groupId?: string
 
     @IsOptional()
     @IsString()
@@ -56,6 +76,11 @@ export class UpdateServiceOrderDto {
     @IsOptional()
     @IsString()
     internalNotes?: string
+
+    @IsOptional()
+    @IsInt()
+    @Min(1)
+    alertAfterHours?: number
 }
 
 export class UpdateServiceOrderStatusDto {
@@ -64,16 +89,20 @@ export class UpdateServiceOrderStatusDto {
 
     @IsOptional()
     @IsString()
-    reason?: string  // Motivo da mudança (obrigatório em reprovação)
+    reason?: string
 
     @IsOptional()
     @IsString()
-    resolution?: string  // Preenchido ao concluir
+    resolution?: string
 }
 
 export class AssignTechnicianDto {
     @IsUUID()
     technicianId: string
+
+    @IsOptional()
+    @IsEnum(ServiceOrderTechnicianRole)
+    role?: ServiceOrderTechnicianRole  // LEAD ou ASSISTANT
 }
 
 export class ListServiceOrdersDto {
@@ -95,19 +124,32 @@ export class ListServiceOrdersDto {
 
     @IsOptional()
     @IsUUID()
-    technicianId?: string
-
-    @IsOptional()
-    @IsUUID()
-    requesterId?: string
+    groupId?: string
 
     @IsOptional()
     @IsString()
-    dateFrom?: string  // Filtro por data de criação
+    dateFrom?: string
 
     @IsOptional()
     @IsString()
     dateTo?: string
+
+    @IsOptional()
+    @Type(() => Number)
+    @IsInt() @Min(1)
+    page?: number = 1
+
+    @IsOptional()
+    @Type(() => Number)
+    @IsInt() @Min(1) @Max(100)
+    limit?: number = 20
+}
+
+// Filtros para o painel de OS disponíveis
+export class ListAvailableServiceOrdersDto {
+    @IsOptional()
+    @IsUUID()
+    groupId?: string  // Filtrar por grupo específico
 
     @IsOptional()
     @Type(() => Number)

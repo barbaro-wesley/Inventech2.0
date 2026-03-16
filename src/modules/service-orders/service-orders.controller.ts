@@ -13,12 +13,13 @@ import {
   UpdateServiceOrderStatusDto,
   AssignTechnicianDto,
   ListServiceOrdersDto,
+  ListAvailableServiceOrdersDto,
 } from './dto/service-order.dto'
 import { CreateCommentDto, UpdateCommentDto } from './comments/dto/comment.dto'
 import { CreateTaskDto, UpdateTaskDto, ReorderTasksDto } from './tasks/dto/task.dto'
 import { CurrentUser } from '../../common/decorators/current-user.decorator'
 import { Roles } from '../../common/decorators/roles.decorator'
-import type { AuthenticatedUser } from '../../common/interfaces/authenticated-user.interface'
+import { AuthenticatedUser } from '../../common/interfaces/authenticated-user.interface'
 
 @Controller('clients/:clientId/service-orders')
 export class ServiceOrdersController {
@@ -27,6 +28,24 @@ export class ServiceOrdersController {
     private readonly commentsService: CommentsService,
     private readonly tasksService: TasksService,
   ) { }
+
+  // ─────────────────────────────────────────
+  // Painel de OS disponíveis para assumir
+  // Rota fora do escopo de cliente — acessível por toda a empresa
+  // GET /service-orders/available
+  // ─────────────────────────────────────────
+  @Get('available')
+  @Roles(
+    UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN,
+    UserRole.COMPANY_MANAGER, UserRole.TECHNICIAN,
+  )
+  findAvailable(
+    @Param('clientId', ParseUUIDPipe) clientId: string,
+    @Query() filters: ListAvailableServiceOrdersDto,
+    @CurrentUser() cu: AuthenticatedUser,
+  ) {
+    return this.serviceOrdersService.findAvailable(cu.companyId!, filters, cu)
+  }
 
   // ─────────────────────────────────────────
   // OS — CRUD principal
@@ -73,8 +92,8 @@ export class ServiceOrdersController {
 
   @Patch(':id')
   @Roles(
-    UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER,
-    UserRole.TECHNICIAN,
+    UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN,
+    UserRole.COMPANY_MANAGER, UserRole.TECHNICIAN,
   )
   update(
     @Param('clientId', ParseUUIDPipe) clientId: string,
@@ -101,19 +120,46 @@ export class ServiceOrdersController {
     return this.serviceOrdersService.updateStatus(id, dto, clientId, cu.companyId!, cu)
   }
 
-  // PATCH /clients/:clientId/service-orders/:id/assign
-  @Patch(':id/assign')
+  // POST /clients/:clientId/service-orders/:id/assume
+  // Técnico assume a OS do painel
+  @Post(':id/assume')
   @HttpCode(HttpStatus.OK)
-  @Roles(
-    UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER,
-  )
-  assignTechnician(
+  @Roles(UserRole.TECHNICIAN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER, UserRole.SUPER_ADMIN)
+  assume(
+    @Param('clientId', ParseUUIDPipe) clientId: string,
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() cu: AuthenticatedUser,
+  ) {
+    return this.serviceOrdersService.assumeServiceOrder(id, clientId, cu.companyId!, cu)
+  }
+
+  // ─────────────────────────────────────────
+  // Técnicos da OS (múltiplos)
+  // ─────────────────────────────────────────
+
+  // POST /clients/:clientId/service-orders/:id/technicians
+  @Post(':id/technicians')
+  @Roles(UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER)
+  addTechnician(
     @Param('clientId', ParseUUIDPipe) clientId: string,
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: AssignTechnicianDto,
     @CurrentUser() cu: AuthenticatedUser,
   ) {
-    return this.serviceOrdersService.assignTechnician(id, dto, clientId, cu.companyId!, cu)
+    return this.serviceOrdersService.addTechnician(id, dto, clientId, cu.companyId!)
+  }
+
+  // DELETE /clients/:clientId/service-orders/:id/technicians/:technicianId
+  @Delete(':id/technicians/:technicianId')
+  @HttpCode(HttpStatus.OK)
+  @Roles(UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER)
+  removeTechnician(
+    @Param('clientId', ParseUUIDPipe) clientId: string,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Param('technicianId', ParseUUIDPipe) technicianId: string,
+    @CurrentUser() cu: AuthenticatedUser,
+  ) {
+    return this.serviceOrdersService.removeTechnician(id, technicianId, clientId, cu.companyId!)
   }
 
   // ─────────────────────────────────────────
@@ -179,8 +225,8 @@ export class ServiceOrdersController {
 
   @Post(':id/tasks')
   @Roles(
-    UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER,
-    UserRole.TECHNICIAN,
+    UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN,
+    UserRole.COMPANY_MANAGER, UserRole.TECHNICIAN,
   )
   createTask(
     @Param('clientId', ParseUUIDPipe) clientId: string,
@@ -193,8 +239,8 @@ export class ServiceOrdersController {
 
   @Patch(':osId/tasks/:taskId')
   @Roles(
-    UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER,
-    UserRole.TECHNICIAN,
+    UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN,
+    UserRole.COMPANY_MANAGER, UserRole.TECHNICIAN,
   )
   updateTask(
     @Param('taskId', ParseUUIDPipe) taskId: string,
@@ -207,8 +253,8 @@ export class ServiceOrdersController {
   @Patch(':id/tasks/reorder')
   @HttpCode(HttpStatus.OK)
   @Roles(
-    UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER,
-    UserRole.TECHNICIAN,
+    UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN,
+    UserRole.COMPANY_MANAGER, UserRole.TECHNICIAN,
   )
   reorderTasks(
     @Param('clientId', ParseUUIDPipe) clientId: string,

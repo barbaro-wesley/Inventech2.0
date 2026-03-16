@@ -6,7 +6,12 @@ import {
     ConflictException,
     Logger,
 } from '@nestjs/common'
-import { Prisma, ServiceOrderStatus, UserRole } from '@prisma/client'
+import {
+    Prisma,
+    ServiceOrderStatus,
+    ServiceOrderTechnicianRole,
+    UserRole,
+} from '@prisma/client'
 import { PrismaService } from '../../prisma/prisma.service'
 import { AuthenticatedUser } from '../../common/interfaces/authenticated-user.interface'
 import {
@@ -15,11 +20,16 @@ import {
     UpdateServiceOrderStatusDto,
     AssignTechnicianDto,
     ListServiceOrdersDto,
+    ListAvailableServiceOrdersDto,
 } from './dto/service-order.dto'
 
-// Máquina de estados — define transições válidas
 const VALID_TRANSITIONS: Record<ServiceOrderStatus, ServiceOrderStatus[]> = {
     [ServiceOrderStatus.OPEN]: [
+        ServiceOrderStatus.AWAITING_PICKUP,
+        ServiceOrderStatus.IN_PROGRESS,
+        ServiceOrderStatus.CANCELLED,
+    ],
+    [ServiceOrderStatus.AWAITING_PICKUP]: [
         ServiceOrderStatus.IN_PROGRESS,
         ServiceOrderStatus.CANCELLED,
     ],
@@ -31,15 +41,12 @@ const VALID_TRANSITIONS: Record<ServiceOrderStatus, ServiceOrderStatus[]> = {
         ServiceOrderStatus.COMPLETED_APPROVED,
         ServiceOrderStatus.COMPLETED_REJECTED,
     ],
-    [ServiceOrderStatus.COMPLETED_APPROVED]: [],  // Estado final
-    [ServiceOrderStatus.COMPLETED_REJECTED]: [
-        ServiceOrderStatus.OPEN,  // Reabre a OS
-    ],
-    [ServiceOrderStatus.CANCELLED]: [],  // Estado final
+    [ServiceOrderStatus.COMPLETED_APPROVED]: [],
+    [ServiceOrderStatus.COMPLETED_REJECTED]: [ServiceOrderStatus.OPEN],
+    [ServiceOrderStatus.CANCELLED]: [],
 }
 
-// Papéis que podem aprovar/reprovar uma OS concluída
-const APPROVER_ROLES: UserRole[] = [
+const APPROVER_ROLES = [
     UserRole.SUPER_ADMIN,
     UserRole.COMPANY_ADMIN,
     UserRole.COMPANY_MANAGER,
@@ -53,6 +60,7 @@ const OS_SELECT = {
     number: true,
     title: true,
     description: true,
+    maintenanceType: true,
     status: true,
     priority: true,
     resolution: true,
@@ -63,11 +71,24 @@ const OS_SELECT = {
     startedAt: true,
     completedAt: true,
     approvedAt: true,
+    isAvailable: true,
+    alertAfterHours: true,
+    alertSentAt: true,
     createdAt: true,
     updatedAt: true,
     equipment: { select: { id: true, name: true, brand: true, model: true } },
     requester: { select: { id: true, name: true, email: true } },
-    technician: { select: { id: true, name: true, email: true } },
+    group: { select: { id: true, name: true, color: true } },
+    technicians: {
+        where: { releasedAt: null },
+        select: {
+            id: true,
+            role: true,
+            assignedAt: true,
+            assumedAt: true,
+            technician: { select: { id: true, name: true, email: true, phone: true } },
+        },
+    },
     _count: {
         select: { comments: true, tasks: true, attachments: true },
     },
@@ -79,9 +100,6 @@ export class ServiceOrdersService {
 
     constructor(private prisma: PrismaService) { }
 
-    // ─────────────────────────────────────────
-    // Listar OS com filtros
-    // ─────────────────────────────────────────
     async findAll(
         clientId: string,
         companyId: string,
@@ -90,8 +108,7 @@ export class ServiceOrdersService {
     ) {
         const {
             search, status, priority, equipmentId,
-            technicianId, requesterId, dateFrom, dateTo,
-            page = 1, limit = 20,
+            groupId, dateFrom, dateTo, page = 1, limit = 20,
         } = filters
 
         const where: Prisma.ServiceOrderWhereInput = {
@@ -101,14 +118,13 @@ export class ServiceOrdersService {
             ...(status && { status }),
             ...(priority && { priority }),
             ...(equipmentId && { equipmentId }),
-            ...(technicianId && { technicianId }),
-            ...(requesterId && { requesterId }),
-            ...(dateFrom || dateTo) && {
+            ...(groupId && { groupId }),
+            ...((dateFrom || dateTo) && {
                 createdAt: {
                     ...(dateFrom && { gte: new Date(dateFrom) }),
                     ...(dateTo && { lte: new Date(dateTo) }),
                 },
-            },
+            }),
             ...(search && {
                 OR: [
                     { title: { contains: search, mode: 'insensitive' } },
@@ -117,9 +133,10 @@ export class ServiceOrdersService {
             }),
         }
 
-        // TECHNICIAN só vê OS atribuídas a ele
         if (currentUser.role === UserRole.TECHNICIAN) {
-            where.technicianId = currentUser.sub
+            where.technicians = {
+                some: { technicianId: currentUser.sub, releasedAt: null },
+            }
         }
 
         const [data, total] = await this.prisma.$transaction([
@@ -136,16 +153,59 @@ export class ServiceOrdersService {
         return { data, total, page, limit }
     }
 
-    // ─────────────────────────────────────────
-    // Buscar OS por ID com detalhes completos
-    // ─────────────────────────────────────────
-    async findOne(id: string, clientId: string, companyId: string, currentUser: AuthenticatedUser) {
+    async findAvailable(
+        companyId: string,
+        filters: ListAvailableServiceOrdersDto,
+        currentUser: AuthenticatedUser,
+    ) {
+        const { groupId, page = 1, limit = 20 } = filters
+
+        let groupIds: string[] = []
+
+        if (groupId) {
+            groupIds = [groupId]
+        } else if (currentUser.role === UserRole.TECHNICIAN) {
+            const techGroups = await this.prisma.technicianGroup.findMany({
+                where: { userId: currentUser.sub, isActive: true },
+                select: { groupId: true },
+            })
+            groupIds = techGroups.map((g) => g.groupId)
+        }
+
+        const where: Prisma.ServiceOrderWhereInput = {
+            companyId,
+            isAvailable: true,
+            status: ServiceOrderStatus.AWAITING_PICKUP,
+            deletedAt: null,
+            ...(groupIds.length > 0 && { groupId: { in: groupIds } }),
+        }
+
+        const [data, total] = await this.prisma.$transaction([
+            this.prisma.serviceOrder.findMany({
+                where,
+                select: OS_SELECT,
+                orderBy: [{ priority: 'desc' }, { createdAt: 'asc' }],
+                skip: (page - 1) * limit,
+                take: limit,
+            }),
+            this.prisma.serviceOrder.count({ where }),
+        ])
+
+        return { data, total, page, limit }
+    }
+
+    async findOne(
+        id: string,
+        clientId: string,
+        companyId: string,
+        currentUser: AuthenticatedUser,
+    ) {
         const os = await this.prisma.serviceOrder.findFirst({
             where: { id, clientId, companyId, deletedAt: null },
             select: {
                 ...OS_SELECT,
                 comments: {
-                    where: this.buildCommentVisibilityFilter(currentUser),
+                    where: this.buildCommentFilter(currentUser),
                     select: {
                         id: true,
                         content: true,
@@ -153,7 +213,6 @@ export class ServiceOrdersService {
                         createdAt: true,
                         updatedAt: true,
                         author: { select: { id: true, name: true, role: true } },
-                        attachments: { select: { id: true, fileName: true, mimeType: true, key: true } },
                     },
                     orderBy: { createdAt: 'asc' },
                 },
@@ -180,42 +239,41 @@ export class ServiceOrdersService {
                     },
                     orderBy: { createdAt: 'asc' },
                 },
-                attachments: {
-                    select: { id: true, fileName: true, mimeType: true, sizeBytes: true, key: true, createdAt: true },
-                },
             },
         })
 
         if (!os) throw new NotFoundException('Ordem de serviço não encontrada')
 
-        // TECHNICIAN só acessa OS atribuída a ele
-        if (
-            currentUser.role === UserRole.TECHNICIAN &&
-            (os as any).technician?.id !== currentUser.sub
-        ) {
-            throw new ForbiddenException('Acesso negado a esta OS')
+        if (currentUser.role === UserRole.TECHNICIAN) {
+            const isLinked = os.technicians.some((t) => t.technician.id === currentUser.sub)
+            if (!isLinked && !os.isAvailable) {
+                throw new ForbiddenException('Acesso negado a esta OS')
+            }
         }
 
         return os
     }
 
-    // ─────────────────────────────────────────
-    // Criar OS com número sequencial por empresa
-    // ─────────────────────────────────────────
     async create(
         dto: CreateServiceOrderDto,
         clientId: string,
         companyId: string,
         currentUser: AuthenticatedUser,
     ) {
-        // Valida equipamento pertence ao cliente
         const equipment = await this.prisma.equipment.findFirst({
             where: { id: dto.equipmentId, clientId, companyId, deletedAt: null },
-            select: { id: true, name: true },
+            select: { id: true },
         })
         if (!equipment) throw new NotFoundException('Equipamento não encontrado neste cliente')
 
-        // Valida técnico pertence à empresa se informado
+        if (dto.groupId) {
+            const group = await this.prisma.maintenanceGroup.findFirst({
+                where: { id: dto.groupId, companyId, isActive: true },
+                select: { id: true },
+            })
+            if (!group) throw new BadRequestException('Grupo de manutenção não encontrado')
+        }
+
         if (dto.technicianId) {
             const technician = await this.prisma.user.findFirst({
                 where: { id: dto.technicianId, companyId, role: UserRole.TECHNICIAN },
@@ -224,9 +282,12 @@ export class ServiceOrdersService {
             if (!technician) throw new BadRequestException('Técnico não encontrado nesta empresa')
         }
 
-        // Gera número sequencial em transação para evitar race condition
+        const isAvailable = !dto.technicianId
+        const initialStatus = isAvailable
+            ? ServiceOrderStatus.AWAITING_PICKUP
+            : ServiceOrderStatus.OPEN
+
         return this.prisma.$transaction(async (tx) => {
-            // Pega o maior número atual da empresa e incrementa
             const last = await tx.serviceOrder.findFirst({
                 where: { companyId },
                 orderBy: { number: 'desc' },
@@ -241,32 +302,198 @@ export class ServiceOrdersService {
                     number,
                     title: dto.title,
                     description: dto.description,
+                    maintenanceType: dto.maintenanceType,
                     priority: dto.priority,
+                    status: initialStatus,
+                    isAvailable,
+                    alertAfterHours: dto.alertAfterHours ?? 2,
                     scheduledFor: dto.scheduledFor ? new Date(dto.scheduledFor) : null,
-                    equipmentId: dto.equipmentId,
-                    requesterId: currentUser.sub,
-                    ...(dto.technicianId && { technicianId: dto.technicianId }),
+                    equipment: { connect: { id: dto.equipmentId } },
+                    requester: { connect: { id: currentUser.sub } },
+                    ...(dto.groupId && { group: { connect: { id: dto.groupId } } }),
                 },
                 select: OS_SELECT,
             })
 
-            // Registra histórico do status inicial
+            if (dto.technicianId) {
+                await tx.serviceOrderTechnician.create({
+                    data: {
+                        serviceOrderId: os.id,
+                        technicianId: dto.technicianId,
+                        role: ServiceOrderTechnicianRole.LEAD,
+                    },
+                })
+            }
+
             await tx.serviceOrderStatusHistory.create({
                 data: {
                     serviceOrderId: os.id,
-                    toStatus: ServiceOrderStatus.OPEN,
+                    toStatus: initialStatus,
                     changedById: currentUser.sub,
                 },
             })
 
-            this.logger.log(`OS #${number} criada: ${os.title} | Cliente: ${clientId}`)
+            this.logger.log(
+                `OS #${number} criada | ${isAvailable ? 'Painel' : 'Técnico: ' + dto.technicianId}`,
+            )
+
             return os
         })
     }
 
-    // ─────────────────────────────────────────
-    // Atualizar dados da OS
-    // ─────────────────────────────────────────
+    async assumeServiceOrder(
+        id: string,
+        clientId: string,
+        companyId: string,
+        currentUser: AuthenticatedUser,
+    ) {
+        const os = await this.prisma.serviceOrder.findFirst({
+            where: { id, clientId, companyId, deletedAt: null },
+            select: { id: true, number: true, status: true, isAvailable: true, groupId: true },
+        })
+
+        if (!os) throw new NotFoundException('OS não encontrada')
+
+        if (!os.isAvailable || os.status !== ServiceOrderStatus.AWAITING_PICKUP) {
+            throw new ConflictException('Esta OS não está disponível para ser assumida')
+        }
+
+        if (os.groupId) {
+            const inGroup = await this.prisma.technicianGroup.findFirst({
+                where: { userId: currentUser.sub, groupId: os.groupId, isActive: true },
+                select: { id: true },
+            })
+            if (!inGroup) {
+                throw new ForbiddenException('Você não pertence ao grupo responsável por esta OS')
+            }
+        }
+
+        const alreadyLinked = await this.prisma.serviceOrderTechnician.findUnique({
+            where: {
+                serviceOrderId_technicianId: {
+                    serviceOrderId: id,
+                    technicianId: currentUser.sub,
+                },
+            },
+            select: { id: true },
+        })
+        if (alreadyLinked) throw new ConflictException('Você já está vinculado a esta OS')
+
+        return this.prisma.$transaction(async (tx) => {
+            await tx.serviceOrderTechnician.create({
+                data: {
+                    serviceOrderId: id,
+                    technicianId: currentUser.sub,
+                    role: ServiceOrderTechnicianRole.LEAD,
+                    assumedAt: new Date(),
+                },
+            })
+
+            const updated = await tx.serviceOrder.update({
+                where: { id },
+                data: {
+                    isAvailable: false,
+                    status: ServiceOrderStatus.IN_PROGRESS,
+                    startedAt: new Date(),
+                },
+                select: OS_SELECT,
+            })
+
+            await tx.serviceOrderStatusHistory.create({
+                data: {
+                    serviceOrderId: id,
+                    fromStatus: ServiceOrderStatus.AWAITING_PICKUP,
+                    toStatus: ServiceOrderStatus.IN_PROGRESS,
+                    changedById: currentUser.sub,
+                    reason: 'Técnico assumiu a OS do painel',
+                },
+            })
+
+            this.logger.log(`OS #${os.number} assumida por: ${currentUser.email}`)
+            return updated
+        })
+    }
+
+    async addTechnician(
+        id: string,
+        dto: AssignTechnicianDto,
+        clientId: string,
+        companyId: string,
+    ) {
+        const os = await this.findExisting(id, clientId, companyId)
+
+        if ([
+            ServiceOrderStatus.COMPLETED_APPROVED,
+            ServiceOrderStatus.CANCELLED,
+        ].includes(os.status)) {
+            throw new ConflictException('Não é possível adicionar técnico neste status')
+        }
+
+        const technician = await this.prisma.user.findFirst({
+            where: { id: dto.technicianId, companyId, role: UserRole.TECHNICIAN },
+            select: { id: true, name: true },
+        })
+        if (!technician) throw new NotFoundException('Técnico não encontrado')
+
+        const alreadyLinked = await this.prisma.serviceOrderTechnician.findUnique({
+            where: {
+                serviceOrderId_technicianId: {
+                    serviceOrderId: id,
+                    technicianId: dto.technicianId,
+                },
+            },
+            select: { id: true, releasedAt: true },
+        })
+
+        if (alreadyLinked && !alreadyLinked.releasedAt) {
+            throw new ConflictException(`${technician.name} já está vinculado a esta OS`)
+        }
+
+        const role = dto.role ?? ServiceOrderTechnicianRole.ASSISTANT
+
+        if (alreadyLinked) {
+            return this.prisma.serviceOrderTechnician.update({
+                where: {
+                    serviceOrderId_technicianId: {
+                        serviceOrderId: id,
+                        technicianId: dto.technicianId,
+                    },
+                },
+                data: { releasedAt: null, role, assignedAt: new Date() },
+            })
+        }
+
+        return this.prisma.serviceOrderTechnician.create({
+            data: { serviceOrderId: id, technicianId: dto.technicianId, role },
+        })
+    }
+
+    async removeTechnician(
+        id: string,
+        technicianId: string,
+        clientId: string,
+        companyId: string,
+    ) {
+        await this.findExisting(id, clientId, companyId)
+
+        const link = await this.prisma.serviceOrderTechnician.findUnique({
+            where: {
+                serviceOrderId_technicianId: { serviceOrderId: id, technicianId },
+            },
+            select: { id: true },
+        })
+        if (!link) throw new NotFoundException('Técnico não está vinculado a esta OS')
+
+        await this.prisma.serviceOrderTechnician.update({
+            where: {
+                serviceOrderId_technicianId: { serviceOrderId: id, technicianId },
+            },
+            data: { releasedAt: new Date() },
+        })
+
+        return { message: 'Técnico removido da OS com sucesso' }
+    }
+
     async update(
         id: string,
         dto: UpdateServiceOrderDto,
@@ -276,24 +503,23 @@ export class ServiceOrdersService {
     ) {
         const os = await this.findExisting(id, clientId, companyId)
 
-        // OS concluída ou cancelada não pode ser editada
-        if (([
+        if ([
             ServiceOrderStatus.COMPLETED_APPROVED,
             ServiceOrderStatus.CANCELLED,
-        ] as ServiceOrderStatus[]).includes(os.status)) {
+        ].includes(os.status)) {
             throw new ConflictException('Esta OS não pode ser editada no status atual')
         }
 
-        // TECHNICIAN só edita resolution e notas
         if (currentUser.role === UserRole.TECHNICIAN) {
-            if (os.technicianId !== currentUser.sub) {
-                throw new ForbiddenException('Você não está atribuído a esta OS')
-            }
+            const isLinked = await this.prisma.serviceOrderTechnician.findFirst({
+                where: { serviceOrderId: id, technicianId: currentUser.sub, releasedAt: null },
+                select: { id: true },
+            })
+            if (!isLinked) throw new ForbiddenException('Você não está vinculado a esta OS')
+
             return this.prisma.serviceOrder.update({
                 where: { id },
-                data: {
-                    ...(dto.resolution !== undefined && { resolution: dto.resolution }),
-                },
+                data: { ...(dto.resolution !== undefined && { resolution: dto.resolution }) },
                 select: OS_SELECT,
             })
         }
@@ -306,12 +532,13 @@ export class ServiceOrdersService {
                 ...(dto.priority && { priority: dto.priority }),
                 ...(dto.resolution !== undefined && { resolution: dto.resolution }),
                 ...(dto.internalNotes !== undefined && { internalNotes: dto.internalNotes }),
+                ...(dto.alertAfterHours !== undefined && { alertAfterHours: dto.alertAfterHours }),
                 ...(dto.scheduledFor !== undefined && {
                     scheduledFor: dto.scheduledFor ? new Date(dto.scheduledFor) : null,
                 }),
-                ...(dto.technicianId !== undefined && {
-                    technician: dto.technicianId
-                        ? { connect: { id: dto.technicianId } }
+                ...(dto.groupId !== undefined && {
+                    group: dto.groupId
+                        ? { connect: { id: dto.groupId } }
                         : { disconnect: true },
                 }),
             },
@@ -319,9 +546,6 @@ export class ServiceOrdersService {
         })
     }
 
-    // ─────────────────────────────────────────
-    // Mudar status com máquina de estados
-    // ─────────────────────────────────────────
     async updateStatus(
         id: string,
         dto: UpdateServiceOrderStatusDto,
@@ -331,7 +555,6 @@ export class ServiceOrdersService {
     ) {
         const os = await this.findExisting(id, clientId, companyId)
 
-        // Valida transição
         const allowedTransitions = VALID_TRANSITIONS[os.status]
         if (!allowedTransitions.includes(dto.status)) {
             throw new BadRequestException(
@@ -340,11 +563,10 @@ export class ServiceOrdersService {
             )
         }
 
-        // Aprovar/reprovar exige papel específico
-        if (([
+        if ([
             ServiceOrderStatus.COMPLETED_APPROVED,
             ServiceOrderStatus.COMPLETED_REJECTED,
-        ] as ServiceOrderStatus[]).includes(dto.status)) {
+        ].includes(dto.status)) {
             if (!APPROVER_ROLES.includes(currentUser.role)) {
                 throw new ForbiddenException('Apenas gestores podem aprovar ou reprovar uma OS')
             }
@@ -353,39 +575,48 @@ export class ServiceOrdersService {
             }
         }
 
-        // TECHNICIAN só pode mover de OPEN → IN_PROGRESS ou IN_PROGRESS → COMPLETED
         if (currentUser.role === UserRole.TECHNICIAN) {
-            if (os.technicianId !== currentUser.sub) {
-                throw new ForbiddenException('Você não está atribuído a esta OS')
-            }
-            const technicianAllowed: ServiceOrderStatus[] = [
-                ServiceOrderStatus.IN_PROGRESS,
-                ServiceOrderStatus.COMPLETED,
-            ]
-            if (!technicianAllowed.includes(dto.status)) {
-                throw new ForbiddenException('Técnicos não podem executar esta transição')
+            const isLinked = await this.prisma.serviceOrderTechnician.findFirst({
+                where: { serviceOrderId: id, technicianId: currentUser.sub, releasedAt: null },
+                select: { id: true },
+            })
+            if (!isLinked) throw new ForbiddenException('Você não está vinculado a esta OS')
+            if (dto.status !== ServiceOrderStatus.COMPLETED) {
+                throw new ForbiddenException('Técnicos só podem concluir uma OS')
             }
         }
 
-        // Dados extras por status
         const statusData: Record<string, any> = {}
         if (dto.status === ServiceOrderStatus.IN_PROGRESS) statusData.startedAt = new Date()
         if (dto.status === ServiceOrderStatus.COMPLETED) {
             statusData.completedAt = new Date()
             if (dto.resolution) statusData.resolution = dto.resolution
         }
-        if (([
+        if ([
             ServiceOrderStatus.COMPLETED_APPROVED,
             ServiceOrderStatus.COMPLETED_REJECTED,
-        ] as ServiceOrderStatus[]).includes(dto.status)) {
+        ].includes(dto.status)) {
             statusData.approvedAt = new Date()
             statusData.approvedById = currentUser.sub
+        }
+
+        // OS reprovada reabre → volta ao painel se não tiver técnico
+        let finalStatus = dto.status
+        if (dto.status === ServiceOrderStatus.OPEN) {
+            const hasTechnician = await this.prisma.serviceOrderTechnician.findFirst({
+                where: { serviceOrderId: id, releasedAt: null },
+                select: { id: true },
+            })
+            if (!hasTechnician) {
+                finalStatus = ServiceOrderStatus.AWAITING_PICKUP
+                statusData.isAvailable = true
+            }
         }
 
         return this.prisma.$transaction(async (tx) => {
             const updated = await tx.serviceOrder.update({
                 where: { id },
-                data: { status: dto.status, ...statusData },
+                data: { status: finalStatus, ...statusData },
                 select: OS_SELECT,
             })
 
@@ -393,74 +624,32 @@ export class ServiceOrdersService {
                 data: {
                     serviceOrderId: id,
                     fromStatus: os.status,
-                    toStatus: dto.status,
+                    toStatus: finalStatus,
                     changedById: currentUser.sub,
                     reason: dto.reason,
                 },
             })
 
-            this.logger.log(
-                `OS #${os.number} status: ${os.status} → ${dto.status} | User: ${currentUser.email}`,
-            )
-
             return updated
         })
     }
 
-    // ─────────────────────────────────────────
-    // Atribuir técnico
-    // ─────────────────────────────────────────
-    async assignTechnician(
-        id: string,
-        dto: AssignTechnicianDto,
-        clientId: string,
-        companyId: string,
-        currentUser: AuthenticatedUser,
-    ) {
-        const os = await this.findExisting(id, clientId, companyId)
-
-        if (([
-            ServiceOrderStatus.COMPLETED_APPROVED,
-            ServiceOrderStatus.CANCELLED,
-        ] as ServiceOrderStatus[]).includes(os.status)) {
-            throw new ConflictException('Não é possível atribuir técnico neste status')
-        }
-
-        const technician = await this.prisma.user.findFirst({
-            where: { id: dto.technicianId, companyId, role: UserRole.TECHNICIAN },
-            select: { id: true, name: true },
-        })
-        if (!technician) throw new NotFoundException('Técnico não encontrado nesta empresa')
-
-        return this.prisma.serviceOrder.update({
-            where: { id },
-            data: { technician: { connect: { id: dto.technicianId } } },
-            select: OS_SELECT,
-        })
-    }
-
-    // ─────────────────────────────────────────
-    // Helpers privados
-    // ─────────────────────────────────────────
     private async findExisting(id: string, clientId: string, companyId: string) {
         const os = await this.prisma.serviceOrder.findFirst({
             where: { id, clientId, companyId, deletedAt: null },
-            select: { id: true, number: true, status: true, technicianId: true },
+            select: { id: true, number: true, status: true },
         })
         if (!os) throw new NotFoundException('Ordem de serviço não encontrada')
         return os
     }
 
-    // Comentários internos são invisíveis para usuários do cliente
-    private buildCommentVisibilityFilter(user: AuthenticatedUser) {
-        const clientRoles: UserRole[] = [
+    private buildCommentFilter(user: AuthenticatedUser) {
+        const clientRoles = [
             UserRole.CLIENT_ADMIN,
             UserRole.CLIENT_USER,
             UserRole.CLIENT_VIEWER,
         ]
-        if (clientRoles.includes(user.role)) {
-            return { isInternal: false }
-        }
+        if (clientRoles.includes(user.role)) return { isInternal: false }
         return {}
     }
 }
