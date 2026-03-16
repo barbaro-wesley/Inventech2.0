@@ -46,7 +46,7 @@ const VALID_TRANSITIONS: Record<ServiceOrderStatus, ServiceOrderStatus[]> = {
     [ServiceOrderStatus.CANCELLED]: [],
 }
 
-const APPROVER_ROLES = [
+const APPROVER_ROLES: UserRole[] = [
     UserRole.SUPER_ADMIN,
     UserRole.COMPANY_ADMIN,
     UserRole.COMPANY_MANAGER,
@@ -308,9 +308,9 @@ export class ServiceOrdersService {
                     isAvailable,
                     alertAfterHours: dto.alertAfterHours ?? 2,
                     scheduledFor: dto.scheduledFor ? new Date(dto.scheduledFor) : null,
-                    equipment: { connect: { id: dto.equipmentId } },
-                    requester: { connect: { id: currentUser.sub } },
-                    ...(dto.groupId && { group: { connect: { id: dto.groupId } } }),
+                    equipmentId: dto.equipmentId,
+                    requesterId: currentUser.sub,
+                    ...(dto.groupId && { groupId: dto.groupId }),
                 },
                 select: OS_SELECT,
             })
@@ -422,10 +422,10 @@ export class ServiceOrdersService {
     ) {
         const os = await this.findExisting(id, clientId, companyId)
 
-        if ([
-            ServiceOrderStatus.COMPLETED_APPROVED,
-            ServiceOrderStatus.CANCELLED,
-        ].includes(os.status)) {
+        if (
+            os.status === ServiceOrderStatus.COMPLETED_APPROVED ||
+            os.status === ServiceOrderStatus.CANCELLED
+        ) {
             throw new ConflictException('Não é possível adicionar técnico neste status')
         }
 
@@ -503,10 +503,10 @@ export class ServiceOrdersService {
     ) {
         const os = await this.findExisting(id, clientId, companyId)
 
-        if ([
-            ServiceOrderStatus.COMPLETED_APPROVED,
-            ServiceOrderStatus.CANCELLED,
-        ].includes(os.status)) {
+        if (
+            os.status === ServiceOrderStatus.COMPLETED_APPROVED ||
+            os.status === ServiceOrderStatus.CANCELLED
+        ) {
             throw new ConflictException('Esta OS não pode ser editada no status atual')
         }
 
@@ -563,10 +563,10 @@ export class ServiceOrdersService {
             )
         }
 
-        if ([
-            ServiceOrderStatus.COMPLETED_APPROVED,
-            ServiceOrderStatus.COMPLETED_REJECTED,
-        ].includes(dto.status)) {
+        if (
+            dto.status === ServiceOrderStatus.COMPLETED_APPROVED ||
+            dto.status === ServiceOrderStatus.COMPLETED_REJECTED
+        ) {
             if (!APPROVER_ROLES.includes(currentUser.role)) {
                 throw new ForbiddenException('Apenas gestores podem aprovar ou reprovar uma OS')
             }
@@ -592,10 +592,10 @@ export class ServiceOrdersService {
             statusData.completedAt = new Date()
             if (dto.resolution) statusData.resolution = dto.resolution
         }
-        if ([
-            ServiceOrderStatus.COMPLETED_APPROVED,
-            ServiceOrderStatus.COMPLETED_REJECTED,
-        ].includes(dto.status)) {
+        if (
+            dto.status === ServiceOrderStatus.COMPLETED_APPROVED ||
+            dto.status === ServiceOrderStatus.COMPLETED_REJECTED
+        ) {
             statusData.approvedAt = new Date()
             statusData.approvedById = currentUser.sub
         }
@@ -644,7 +644,7 @@ export class ServiceOrdersService {
     }
 
     private buildCommentFilter(user: AuthenticatedUser) {
-        const clientRoles = [
+        const clientRoles: UserRole[] = [
             UserRole.CLIENT_ADMIN,
             UserRole.CLIENT_USER,
             UserRole.CLIENT_VIEWER,

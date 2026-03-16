@@ -19,7 +19,7 @@ import { CreateCommentDto, UpdateCommentDto } from './comments/dto/comment.dto'
 import { CreateTaskDto, UpdateTaskDto, ReorderTasksDto } from './tasks/dto/task.dto'
 import { CurrentUser } from '../../common/decorators/current-user.decorator'
 import { Roles } from '../../common/decorators/roles.decorator'
-import { AuthenticatedUser } from '../../common/interfaces/authenticated-user.interface'
+import type { AuthenticatedUser } from '../../common/interfaces/authenticated-user.interface'
 
 @Controller('clients/:clientId/service-orders')
 export class ServiceOrdersController {

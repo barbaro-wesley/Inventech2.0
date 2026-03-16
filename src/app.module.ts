@@ -11,6 +11,7 @@ import { ClientsModule } from './modules/clients/clients.module'
 import { JwtAuthGuard } from './modules/auth/guards/jwt-auth.guard'
 import { RolesGuard } from './common/guards/roles.guard'
 import { GlobalExceptionFilter } from './common/filters/http-exception.filter'
+import { MaintenanceModule } from './modules/maintenance/maintenance.module'
 
 @Module({
   imports: [
@@ -27,7 +28,7 @@ import { GlobalExceptionFilter } from './common/filters/http-exception.filter'
     ClientsModule,
     EquipmentModule,
     ServiceOrdersModule,
-    // MaintenanceModule,
+    MaintenanceModule,
     // NotificationsModule,
     // StorageModule,
   ],
