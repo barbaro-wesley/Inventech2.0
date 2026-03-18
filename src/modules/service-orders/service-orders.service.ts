@@ -323,9 +323,9 @@ export class ServiceOrdersService {
                     isAvailable,
                     alertAfterHours: dto.alertAfterHours ?? 2,
                     scheduledFor: dto.scheduledFor ? new Date(dto.scheduledFor) : null,
-                    equipment: { connect: { id: dto.equipmentId } },
-                    requester: { connect: { id: currentUser.sub } },
-                    ...(dto.groupId && { group: { connect: { id: dto.groupId } } }),
+                    equipmentId: dto.equipmentId,
+                    requesterId: currentUser.sub,
+                    ...(dto.groupId && { groupId: dto.groupId }),
                 },
                 select: OS_SELECT,
             })
@@ -753,7 +753,7 @@ export class ServiceOrdersService {
     }
 
     private buildCommentFilter(user: AuthenticatedUser) {
-        const clientRoles = [UserRole.CLIENT_ADMIN, UserRole.CLIENT_USER, UserRole.CLIENT_VIEWER]
+        const clientRoles: UserRole[] = [UserRole.CLIENT_ADMIN, UserRole.CLIENT_USER, UserRole.CLIENT_VIEWER]
         if (clientRoles.includes(user.role)) return { isInternal: false }
         return {}
     }
