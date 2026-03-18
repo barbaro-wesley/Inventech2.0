@@ -3,10 +3,11 @@ import {
     NotFoundException,
     ConflictException,
 } from '@nestjs/common'
-import { Prisma } from '@prisma/client'
+import { Prisma, AttachmentEntity } from '@prisma/client'
 import { PrismaService } from '../../prisma/prisma.service'
 import { AuthenticatedUser } from '../../common/interfaces/authenticated-user.interface'
 import { CreateEquipmentDto, UpdateEquipmentDto, ListEquipmentsDto } from './dto/equipment.dto'
+import { StorageService } from '../storage/storage.service'
 
 const EQUIPMENT_SELECT = {
     id: true,
@@ -48,7 +49,10 @@ const EQUIPMENT_SELECT = {
 
 @Injectable()
 export class EquipmentService {
-    constructor(private prisma: PrismaService) { }
+    constructor(
+        private prisma: PrismaService,
+        private storageService: StorageService,
+    ) { }
 
     async findAll(
         clientId: string,
@@ -105,6 +109,7 @@ export class EquipmentService {
         clientId: string,
         companyId: string,
         currentUser: AuthenticatedUser,
+        files: Express.Multer.File[] = [],
     ) {
         // Valida número de série único no cliente
         if (dto.serialNumber) {
@@ -131,7 +136,7 @@ export class EquipmentService {
         // Calcula valor atual inicial (igual ao de compra)
         const currentValue = dto.purchaseValue ? dto.purchaseValue : null
 
-        return this.prisma.equipment.create({
+        const equipment = await this.prisma.equipment.create({
             data: {
                 companyId,
                 clientId,
@@ -163,6 +168,23 @@ export class EquipmentService {
             },
             select: EQUIPMENT_SELECT,
         })
+
+        // Faz upload dos arquivos se enviados junto com o cadastro
+        if (files && files.length > 0) {
+            await Promise.all(
+                files.map((file) =>
+                    this.storageService.upload(
+                        file,
+                        { entity: AttachmentEntity.EQUIPMENT, entityId: equipment.id },
+                        companyId,
+                        clientId,
+                        currentUser,
+                    ),
+                ),
+            )
+        }
+
+        return equipment
     }
 
     async update(

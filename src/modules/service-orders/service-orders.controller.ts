@@ -1,25 +1,27 @@
 import {
   Controller, Get, Post, Patch, Delete,
   Body, Param, Query, ParseUUIDPipe,
-  HttpCode, HttpStatus,
+  HttpCode, HttpStatus, UseInterceptors,
+  UploadedFiles, BadRequestException,
 } from '@nestjs/common'
-import { UserRole } from '@prisma/client'
+import { FilesInterceptor } from '@nestjs/platform-express'
+import { memoryStorage } from 'multer'
+import { UserRole, AttachmentEntity } from '@prisma/client'
 import { ServiceOrdersService } from './service-orders.service'
 import { CommentsService } from './comments/comments.service'
 import { TasksService } from './tasks/tasks.service'
+import { StorageService } from '../storage/storage.service'
 import {
-  CreateServiceOrderDto,
-  UpdateServiceOrderDto,
-  UpdateServiceOrderStatusDto,
-  AssignTechnicianDto,
-  ListServiceOrdersDto,
-  ListAvailableServiceOrdersDto,
+  CreateServiceOrderDto, UpdateServiceOrderDto,
+  UpdateServiceOrderStatusDto, AssignTechnicianDto,
+  ListServiceOrdersDto, ListAvailableServiceOrdersDto,
 } from './dto/service-order.dto'
 import { CreateCommentDto, UpdateCommentDto } from './comments/dto/comment.dto'
 import { CreateTaskDto, UpdateTaskDto, ReorderTasksDto } from './tasks/dto/task.dto'
 import { CurrentUser } from '../../common/decorators/current-user.decorator'
 import { Roles } from '../../common/decorators/roles.decorator'
 import type { AuthenticatedUser } from '../../common/interfaces/authenticated-user.interface'
+import { ALLOWED_MIME_LIST } from '../storage/storage.constants'
 
 @Controller('clients/:clientId/service-orders')
 export class ServiceOrdersController {
@@ -27,18 +29,14 @@ export class ServiceOrdersController {
     private readonly serviceOrdersService: ServiceOrdersService,
     private readonly commentsService: CommentsService,
     private readonly tasksService: TasksService,
+    private readonly storageService: StorageService,
   ) { }
 
   // ─────────────────────────────────────────
   // Painel de OS disponíveis para assumir
-  // Rota fora do escopo de cliente — acessível por toda a empresa
-  // GET /service-orders/available
   // ─────────────────────────────────────────
   @Get('available')
-  @Roles(
-    UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN,
-    UserRole.COMPANY_MANAGER, UserRole.TECHNICIAN,
-  )
+  @Roles(UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER, UserRole.TECHNICIAN)
   findAvailable(
     @Param('clientId', ParseUUIDPipe) clientId: string,
     @Query() filters: ListAvailableServiceOrdersDto,
@@ -48,14 +46,12 @@ export class ServiceOrdersController {
   }
 
   // ─────────────────────────────────────────
-  // OS — CRUD principal
+  // OS — CRUD
   // ─────────────────────────────────────────
 
   @Get()
-  @Roles(
-    UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER,
-    UserRole.TECHNICIAN, UserRole.CLIENT_ADMIN, UserRole.CLIENT_USER, UserRole.CLIENT_VIEWER,
-  )
+  @Roles(UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER,
+    UserRole.TECHNICIAN, UserRole.CLIENT_ADMIN, UserRole.CLIENT_USER, UserRole.CLIENT_VIEWER)
   findAll(
     @Param('clientId', ParseUUIDPipe) clientId: string,
     @Query() filters: ListServiceOrdersDto,
@@ -65,10 +61,8 @@ export class ServiceOrdersController {
   }
 
   @Get(':id')
-  @Roles(
-    UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER,
-    UserRole.TECHNICIAN, UserRole.CLIENT_ADMIN, UserRole.CLIENT_USER, UserRole.CLIENT_VIEWER,
-  )
+  @Roles(UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER,
+    UserRole.TECHNICIAN, UserRole.CLIENT_ADMIN, UserRole.CLIENT_USER, UserRole.CLIENT_VIEWER)
   findOne(
     @Param('clientId', ParseUUIDPipe) clientId: string,
     @Param('id', ParseUUIDPipe) id: string,
@@ -77,24 +71,54 @@ export class ServiceOrdersController {
     return this.serviceOrdersService.findOne(id, clientId, cu.companyId!, cu)
   }
 
+  // ─────────────────────────────────────────
+  // POST /service-orders — cria OS com arquivos opcionais
+  // Aceita multipart/form-data
+  // ─────────────────────────────────────────
   @Post()
-  @Roles(
-    UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER,
-    UserRole.CLIENT_ADMIN, UserRole.CLIENT_USER,
+  @Roles(UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER,
+    UserRole.CLIENT_ADMIN, UserRole.CLIENT_USER)
+  @UseInterceptors(
+    FilesInterceptor('files', 10, {
+      storage: memoryStorage(),
+      limits: { fileSize: 20 * 1024 * 1024 },
+      fileFilter: (_req, file, cb) => {
+        if (ALLOWED_MIME_LIST.includes(file.mimetype)) {
+          cb(null, true)
+        } else {
+          cb(new BadRequestException(`Tipo não permitido: ${file.mimetype}`), false)
+        }
+      },
+    }),
   )
-  create(
+  async create(
     @Param('clientId', ParseUUIDPipe) clientId: string,
     @Body() dto: CreateServiceOrderDto,
+    @UploadedFiles() files: Express.Multer.File[],
     @CurrentUser() cu: AuthenticatedUser,
   ) {
-    return this.serviceOrdersService.create(dto, clientId, cu.companyId!, cu)
+    const os = await this.serviceOrdersService.create(dto, clientId, cu.companyId!, cu)
+
+    // Faz upload dos arquivos junto com a criação
+    if (files?.length > 0) {
+      await Promise.all(
+        files.map((file) =>
+          this.storageService.upload(
+            file,
+            { entity: AttachmentEntity.SERVICE_ORDER, entityId: os.id },
+            cu.companyId!,
+            clientId,
+            cu,
+          ),
+        ),
+      )
+    }
+
+    return os
   }
 
   @Patch(':id')
-  @Roles(
-    UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN,
-    UserRole.COMPANY_MANAGER, UserRole.TECHNICIAN,
-  )
+  @Roles(UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER, UserRole.TECHNICIAN)
   update(
     @Param('clientId', ParseUUIDPipe) clientId: string,
     @Param('id', ParseUUIDPipe) id: string,
@@ -104,13 +128,10 @@ export class ServiceOrdersController {
     return this.serviceOrdersService.update(id, dto, clientId, cu.companyId!, cu)
   }
 
-  // PATCH /clients/:clientId/service-orders/:id/status
   @Patch(':id/status')
   @HttpCode(HttpStatus.OK)
-  @Roles(
-    UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER,
-    UserRole.TECHNICIAN, UserRole.CLIENT_ADMIN,
-  )
+  @Roles(UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER,
+    UserRole.TECHNICIAN, UserRole.CLIENT_ADMIN)
   updateStatus(
     @Param('clientId', ParseUUIDPipe) clientId: string,
     @Param('id', ParseUUIDPipe) id: string,
@@ -120,8 +141,6 @@ export class ServiceOrdersController {
     return this.serviceOrdersService.updateStatus(id, dto, clientId, cu.companyId!, cu)
   }
 
-  // POST /clients/:clientId/service-orders/:id/assume
-  // Técnico assume a OS do painel
   @Post(':id/assume')
   @HttpCode(HttpStatus.OK)
   @Roles(UserRole.TECHNICIAN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER, UserRole.SUPER_ADMIN)
@@ -134,10 +153,9 @@ export class ServiceOrdersController {
   }
 
   // ─────────────────────────────────────────
-  // Técnicos da OS (múltiplos)
+  // Técnicos
   // ─────────────────────────────────────────
 
-  // POST /clients/:clientId/service-orders/:id/technicians
   @Post(':id/technicians')
   @Roles(UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER)
   addTechnician(
@@ -149,7 +167,6 @@ export class ServiceOrdersController {
     return this.serviceOrdersService.addTechnician(id, dto, clientId, cu.companyId!)
   }
 
-  // DELETE /clients/:clientId/service-orders/:id/technicians/:technicianId
   @Delete(':id/technicians/:technicianId')
   @HttpCode(HttpStatus.OK)
   @Roles(UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER)
@@ -163,28 +180,52 @@ export class ServiceOrdersController {
   }
 
   // ─────────────────────────────────────────
-  // Comentários
+  // Comentários — com upload de arquivos
   // ─────────────────────────────────────────
 
   @Post(':id/comments')
-  @Roles(
-    UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER,
-    UserRole.TECHNICIAN, UserRole.CLIENT_ADMIN, UserRole.CLIENT_USER,
+  @Roles(UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER,
+    UserRole.TECHNICIAN, UserRole.CLIENT_ADMIN, UserRole.CLIENT_USER)
+  @UseInterceptors(
+    FilesInterceptor('files', 5, {
+      storage: memoryStorage(),
+      limits: { fileSize: 10 * 1024 * 1024 },
+      fileFilter: (_req, file, cb) => {
+        if (ALLOWED_MIME_LIST.includes(file.mimetype)) cb(null, true)
+        else cb(new BadRequestException(`Tipo não permitido: ${file.mimetype}`), false)
+      },
+    }),
   )
-  createComment(
+  async createComment(
     @Param('clientId', ParseUUIDPipe) clientId: string,
     @Param('id', ParseUUIDPipe) serviceOrderId: string,
     @Body() dto: CreateCommentDto,
+    @UploadedFiles() files: Express.Multer.File[],
     @CurrentUser() cu: AuthenticatedUser,
   ) {
-    return this.commentsService.create(serviceOrderId, dto, clientId, cu.companyId!, cu)
+    const comment = await this.commentsService.create(serviceOrderId, dto, clientId, cu.companyId!, cu)
+
+    // Upload de arquivos anexados ao comentário
+    if (files?.length > 0) {
+      await Promise.all(
+        files.map((file) =>
+          this.storageService.upload(
+            file,
+            { entity: AttachmentEntity.COMMENT, entityId: comment.id },
+            cu.companyId!,
+            clientId,
+            cu,
+          ),
+        ),
+      )
+    }
+
+    return comment
   }
 
   @Patch(':osId/comments/:commentId')
-  @Roles(
-    UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER,
-    UserRole.TECHNICIAN, UserRole.CLIENT_ADMIN, UserRole.CLIENT_USER,
-  )
+  @Roles(UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER,
+    UserRole.TECHNICIAN, UserRole.CLIENT_ADMIN, UserRole.CLIENT_USER)
   updateComment(
     @Param('commentId', ParseUUIDPipe) commentId: string,
     @Body() dto: UpdateCommentDto,
@@ -195,10 +236,8 @@ export class ServiceOrdersController {
 
   @Delete(':osId/comments/:commentId')
   @HttpCode(HttpStatus.OK)
-  @Roles(
-    UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER,
-    UserRole.TECHNICIAN, UserRole.CLIENT_ADMIN, UserRole.CLIENT_USER,
-  )
+  @Roles(UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER,
+    UserRole.TECHNICIAN, UserRole.CLIENT_ADMIN, UserRole.CLIENT_USER)
   removeComment(
     @Param('commentId', ParseUUIDPipe) commentId: string,
     @CurrentUser() cu: AuthenticatedUser,
@@ -211,10 +250,8 @@ export class ServiceOrdersController {
   // ─────────────────────────────────────────
 
   @Get(':id/tasks')
-  @Roles(
-    UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER,
-    UserRole.TECHNICIAN, UserRole.CLIENT_ADMIN, UserRole.CLIENT_USER, UserRole.CLIENT_VIEWER,
-  )
+  @Roles(UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER,
+    UserRole.TECHNICIAN, UserRole.CLIENT_ADMIN, UserRole.CLIENT_USER, UserRole.CLIENT_VIEWER)
   findTasks(
     @Param('clientId', ParseUUIDPipe) clientId: string,
     @Param('id', ParseUUIDPipe) serviceOrderId: string,
@@ -224,10 +261,7 @@ export class ServiceOrdersController {
   }
 
   @Post(':id/tasks')
-  @Roles(
-    UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN,
-    UserRole.COMPANY_MANAGER, UserRole.TECHNICIAN,
-  )
+  @Roles(UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER, UserRole.TECHNICIAN)
   createTask(
     @Param('clientId', ParseUUIDPipe) clientId: string,
     @Param('id', ParseUUIDPipe) serviceOrderId: string,
@@ -238,10 +272,7 @@ export class ServiceOrdersController {
   }
 
   @Patch(':osId/tasks/:taskId')
-  @Roles(
-    UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN,
-    UserRole.COMPANY_MANAGER, UserRole.TECHNICIAN,
-  )
+  @Roles(UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER, UserRole.TECHNICIAN)
   updateTask(
     @Param('taskId', ParseUUIDPipe) taskId: string,
     @Body() dto: UpdateTaskDto,
@@ -252,10 +283,7 @@ export class ServiceOrdersController {
 
   @Patch(':id/tasks/reorder')
   @HttpCode(HttpStatus.OK)
-  @Roles(
-    UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN,
-    UserRole.COMPANY_MANAGER, UserRole.TECHNICIAN,
-  )
+  @Roles(UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER, UserRole.TECHNICIAN)
   reorderTasks(
     @Param('clientId', ParseUUIDPipe) clientId: string,
     @Param('id', ParseUUIDPipe) serviceOrderId: string,
@@ -267,9 +295,7 @@ export class ServiceOrdersController {
 
   @Delete(':osId/tasks/:taskId')
   @HttpCode(HttpStatus.OK)
-  @Roles(
-    UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER,
-  )
+  @Roles(UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER)
   removeTask(@Param('taskId', ParseUUIDPipe) taskId: string) {
     return this.tasksService.remove(taskId)
   }

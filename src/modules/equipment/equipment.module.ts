@@ -19,8 +19,9 @@ import { EquipmentTypesController } from './equipment-types/equipment-types.cont
 // Movements
 import { MovementsService } from './movement/movements.service'
 import { MovementsController } from './movement/movements.controller'
-
+import { StorageModule } from '../storage/storage.module'
 @Module({
+    imports: [StorageModule],
     controllers: [
         EquipmentController,
         LocationsController,
