@@ -4,6 +4,7 @@
 
 generator client {
   provider = "prisma-client-js"
+  previewFeatures = ["driverAdapters"]
 }
 
 datasource db {
@@ -28,6 +29,8 @@ enum UserStatus {
   ACTIVE
   INACTIVE
   SUSPENDED
+  BLOCKED     // Bloqueado por tentativas excessivas
+  UNVERIFIED  // Email não verificado
 }
 
 enum CompanyStatus {
@@ -137,6 +140,13 @@ enum AttachmentEntity {
   INVOICE
   AVATAR
   COMMENT
+}
+
+enum TwoFactorType {
+  LOGIN
+  EMAIL_CHANGE
+  PASSWORD_RESET
+  SENSITIVE_ACTION
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -255,6 +265,11 @@ model User {
   movementsApproved       EquipmentMovement[]       @relation("MovementApprover")
   maintenancesExecuted    Maintenance[]
   technicianGroups        TechnicianGroup[]
+  loginAttempts           LoginAttempt[]
+  accountBlocks           AccountBlock[]
+  twoFactorCodes          TwoFactorCode[]
+  emailVerifications      EmailVerification[]
+  passwordResets          PasswordReset[]
 
   @@index([companyId])
   @@index([clientId])
@@ -795,4 +810,115 @@ model Notification {
   @@index([status, createdAt])
   @@index([companyId, createdAt])
   @@map("notifications")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LOGIN ATTEMPT — Auditoria e bloqueio de conta
+// ─────────────────────────────────────────────────────────────────────────────
+
+model LoginAttempt {
+  id          String   @id @default(uuid())
+  email       String   // Email tentado (pode não existir no sistema)
+  userId      String?  @map("user_id") // Preenchido se o email existir
+  success     Boolean
+  ipAddress   String   @map("ip_address")
+  userAgent   String?  @map("user_agent")
+  // Geolocalização do IP
+  country     String?
+  region      String?
+  city        String?
+  latitude    Float?
+  longitude   Float?
+  // Motivo da falha
+  failReason  String?  @map("fail_reason") // WRONG_PASSWORD, USER_NOT_FOUND, ACCOUNT_BLOCKED etc.
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([email, createdAt])
+  @@index([userId, createdAt])
+  @@index([ipAddress, createdAt])
+  @@map("login_attempts")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ACCOUNT BLOCK — Bloqueio temporário após tentativas excessivas
+// ─────────────────────────────────────────────────────────────────────────────
+
+model AccountBlock {
+  id          String    @id @default(uuid())
+  userId      String    @map("user_id")
+  ipAddress   String?   @map("ip_address")
+  reason      String    // Motivo do bloqueio
+  blockedAt   DateTime  @default(now()) @map("blocked_at")
+  expiresAt   DateTime  @map("expires_at") // Null = bloqueio permanente
+  unblocked   Boolean   @default(false)
+  unblockedAt DateTime? @map("unblocked_at")
+  unblockedBy String?   @map("unblocked_by") // Admin que desbloqueou
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, unblocked])
+  @@index([expiresAt])
+  @@map("account_blocks")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TWO FACTOR AUTH — Código de verificação em duas etapas
+// ─────────────────────────────────────────────────────────────────────────────
+
+model TwoFactorCode {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  code      String   // Hash do código de 6 dígitos
+  type      TwoFactorType
+  expiresAt DateTime @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  ipAddress String?  @map("ip_address")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type])
+  @@index([expiresAt])
+  @@map("two_factor_codes")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EMAIL VERIFICATION — Verificação de email no cadastro
+// ─────────────────────────────────────────────────────────────────────────────
+
+model EmailVerification {
+  id        String    @id @default(uuid())
+  userId    String    @map("user_id")
+  token     String    @unique // Token de verificação
+  expiresAt DateTime  @map("expires_at")
+  verifiedAt DateTime? @map("verified_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([token])
+  @@index([userId])
+  @@map("email_verifications")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PASSWORD RESET — Recuperação de senha
+// ─────────────────────────────────────────────────────────────────────────────
+
+model PasswordReset {
+  id        String    @id @default(uuid())
+  userId    String    @map("user_id")
+  token     String    @unique // Token de reset (hash)
+  ipAddress String?   @map("ip_address")
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([token])
+  @@index([userId])
+  @@map("password_resets")
 }

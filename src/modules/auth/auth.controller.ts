@@ -1,37 +1,58 @@
 import {
-  Controller,
-  Post,
-  Get,
-  Body,
-  Res,
-  Req,
-  HttpCode,
-  HttpStatus,
-  UseGuards,
+  Controller, Post, Get, Body, Res, Req,
+  HttpCode, HttpStatus, UseGuards, Param, ParseUUIDPipe,
 } from '@nestjs/common'
-import type  { Request, Response } from 'express'
+import type { Request, Response } from 'express'
+import { IsEmail, IsString, MinLength, IsOptional } from 'class-validator'
 import { AuthService } from './auth.service'
 import { LoginDto } from './dto/login.dto'
-import { JwtAuthGuard } from './guards/jwt-auth.guard'
 import { JwtRefreshGuard } from './guards/jwt-auth.guard'
 import { Public } from '../../common/decorators/public.decorator'
 import { CurrentUser } from '../../common/decorators/current-user.decorator'
 import type { AuthenticatedUser } from '../../common/interfaces/authenticated-user.interface'
+import { TwoFactorService } from './security/two-factor.service'
+import { LoginSecurityService } from './security/login-security.service'
 
-// Configuração dos cookies
+class ForgotPasswordDto {
+  @IsEmail()
+  email: string
+}
+
+class ResetPasswordDto {
+  @IsString()
+  token: string
+
+  @IsString()
+  @MinLength(6)
+  newPassword: string
+}
+
+class VerifyEmailDto {
+  @IsString()
+  token: string
+}
+
+class TwoFactorVerifyDto {
+  @IsString()
+  code: string
+}
+
 const COOKIE_OPTIONS = {
   httpOnly: true,
   secure: process.env.NODE_ENV === 'production',
   sameSite: 'lax' as const,
   path: '/',
 }
-
-const ACCESS_TOKEN_MAX_AGE  = 15 * 60 * 1000        // 15 minutos
-const REFRESH_TOKEN_MAX_AGE = 7 * 24 * 60 * 60 * 1000 // 7 dias
+const ACCESS_MAX_AGE = 15 * 60 * 1000
+const REFRESH_MAX_AGE = 7 * 24 * 60 * 60 * 1000
 
 @Controller('auth')
 export class AuthController {
-  constructor(private readonly authService: AuthService) {}
+  constructor(
+    private readonly authService: AuthService,
+    private readonly twoFactorService: TwoFactorService,
+    private readonly loginSecurityService: LoginSecurityService,
+  ) { }
 
   // ─────────────────────────────────────────
   // POST /auth/login
@@ -44,33 +65,17 @@ export class AuthController {
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ) {
-    const ipAddress = req.ip
-    const userAgent = req.headers['user-agent']
-
     const { accessToken, refreshToken, user } = await this.authService.login(
-      dto,
-      ipAddress,
-      userAgent,
+      dto, req.ip, req.headers['user-agent'],
     )
 
-    // Define cookies HTTP-Only
-    res.cookie('access_token', accessToken, {
-      ...COOKIE_OPTIONS,
-      maxAge: ACCESS_TOKEN_MAX_AGE,
-    })
-
-    res.cookie('refresh_token', refreshToken, {
-      ...COOKIE_OPTIONS,
-      maxAge: REFRESH_TOKEN_MAX_AGE,
-    })
+    res.cookie('access_token', accessToken, { ...COOKIE_OPTIONS, maxAge: ACCESS_MAX_AGE })
+    res.cookie('refresh_token', refreshToken, { ...COOKIE_OPTIONS, maxAge: REFRESH_MAX_AGE })
 
     return {
       user: {
-        id: user.sub,
-        email: user.email,
-        role: user.role,
-        companyId: user.companyId,
-        clientId: user.clientId,
+        id: user.sub, email: user.email,
+        role: user.role, companyId: user.companyId, clientId: user.clientId,
       },
     }
   }
@@ -87,23 +92,12 @@ export class AuthController {
     @Res({ passthrough: true }) res: Response,
   ) {
     const user = req.user as AuthenticatedUser & { refreshToken: string }
-
     const { accessToken, refreshToken } = await this.authService.refresh(
-      user.sub,
-      user.refreshToken,
-      req.ip,
-      req.headers['user-agent'],
+      user.sub, user.refreshToken, req.ip, req.headers['user-agent'],
     )
 
-    res.cookie('access_token', accessToken, {
-      ...COOKIE_OPTIONS,
-      maxAge: ACCESS_TOKEN_MAX_AGE,
-    })
-
-    res.cookie('refresh_token', refreshToken, {
-      ...COOKIE_OPTIONS,
-      maxAge: REFRESH_TOKEN_MAX_AGE,
-    })
+    res.cookie('access_token', accessToken, { ...COOKIE_OPTIONS, maxAge: ACCESS_MAX_AGE })
+    res.cookie('refresh_token', refreshToken, { ...COOKIE_OPTIONS, maxAge: REFRESH_MAX_AGE })
 
     return { message: 'Tokens renovados com sucesso' }
   }
@@ -119,12 +113,8 @@ export class AuthController {
     @CurrentUser() user: AuthenticatedUser,
   ) {
     const rawRefreshToken = req.cookies?.['refresh_token']
+    if (rawRefreshToken) await this.authService.logout(user.sub, rawRefreshToken)
 
-    if (rawRefreshToken) {
-      await this.authService.logout(user.sub, rawRefreshToken)
-    }
-
-    // Limpa os cookies
     res.clearCookie('access_token', COOKIE_OPTIONS)
     res.clearCookie('refresh_token', COOKIE_OPTIONS)
 
@@ -132,16 +122,81 @@ export class AuthController {
   }
 
   // ─────────────────────────────────────────
-  // GET /auth/me — retorna usuário logado
+  // GET /auth/me
   // ─────────────────────────────────────────
   @Get('me')
   me(@CurrentUser() user: AuthenticatedUser) {
     return {
-      id: user.sub,
-      email: user.email,
-      role: user.role,
-      companyId: user.companyId,
-      clientId: user.clientId,
+      id: user.sub, email: user.email,
+      role: user.role, companyId: user.companyId, clientId: user.clientId,
     }
+  }
+
+  // ─────────────────────────────────────────
+  // GET /auth/login-history — histórico de logins
+  // ─────────────────────────────────────────
+  @Get('login-history')
+  getLoginHistory(@CurrentUser() user: AuthenticatedUser) {
+    return this.loginSecurityService.getLoginHistory(user.sub)
+  }
+
+  // ─────────────────────────────────────────
+  // 2FA — Verificação em duas etapas
+  // ─────────────────────────────────────────
+
+  // POST /auth/2fa/send — solicita código 2FA
+  @Post('2fa/send')
+  @HttpCode(HttpStatus.OK)
+  async send2FA(
+    @CurrentUser() user: AuthenticatedUser,
+    @Req() req: Request,
+  ) {
+    await this.twoFactorService.sendTwoFactorCode(user.sub, 'LOGIN', req.ip)
+    return { message: 'Código enviado para o seu email' }
+  }
+
+  // POST /auth/2fa/verify — valida código 2FA
+  @Public()
+  @Post('2fa/verify')
+  @HttpCode(HttpStatus.OK)
+  async verify2FA(
+    @Body() dto: TwoFactorVerifyDto & { userId: string },
+  ) {
+    await this.twoFactorService.verifyCode(dto.userId, dto.code, 'LOGIN')
+    return { verified: true }
+  }
+
+  // ─────────────────────────────────────────
+  // Email — verificação e reset de senha
+  // ─────────────────────────────────────────
+
+  // POST /auth/verify-email — verifica token de email
+  @Public()
+  @Post('verify-email')
+  @HttpCode(HttpStatus.OK)
+  async verifyEmail(@Body() dto: VerifyEmailDto) {
+    await this.twoFactorService.verifyEmailToken(dto.token)
+    return { message: 'Email verificado com sucesso! Você já pode fazer login.' }
+  }
+
+  // POST /auth/forgot-password — solicita reset de senha
+  @Public()
+  @Post('forgot-password')
+  @HttpCode(HttpStatus.OK)
+  async forgotPassword(@Body() dto: ForgotPasswordDto, @Req() req: Request) {
+    // Não revela se o email existe ou não (segurança)
+    await this.twoFactorService.sendPasswordReset(dto.email, req.ip)
+    return {
+      message: 'Se o email estiver cadastrado, você receberá as instruções em breve.',
+    }
+  }
+
+  // POST /auth/reset-password — redefine senha com token
+  @Public()
+  @Post('reset-password')
+  @HttpCode(HttpStatus.OK)
+  async resetPassword(@Body() dto: ResetPasswordDto) {
+    await this.twoFactorService.resetPassword(dto.token, dto.newPassword)
+    return { message: 'Senha redefinida com sucesso! Faça login com a nova senha.' }
   }
 }

@@ -5,11 +5,13 @@ import {
 } from '@nestjs/common'
 import { JwtService } from '@nestjs/jwt'
 import { ConfigService } from '@nestjs/config'
-import { UserStatus } from '@prisma/client'
+import { UserStatus, RefreshToken } from '@prisma/client'
 import * as bcrypt from 'bcrypt'
 import { PrismaService } from '../../prisma/prisma.service'
 import { LoginDto } from './dto/login.dto'
 import { AuthenticatedUser } from '../../common/interfaces/authenticated-user.interface'
+import { LoginSecurityService } from './security/login-security.service'
+import { TwoFactorService } from './security/two-factor.service'
 
 @Injectable()
 export class AuthService {
@@ -19,34 +21,82 @@ export class AuthService {
         private prisma: PrismaService,
         private jwtService: JwtService,
         private configService: ConfigService,
+        private loginSecurityService: LoginSecurityService,
+        private twoFactorService: TwoFactorService,
     ) { }
 
     // ─────────────────────────────────────────
-    // Login
+    // Login com auditoria e bloqueio
     // ─────────────────────────────────────────
     async login(dto: LoginDto, ipAddress?: string, userAgent?: string) {
-        // 1. Busca o usuário
+        // 1. Verifica bloqueio antes de qualquer coisa
+        const blockCheck = await this.loginSecurityService.checkIsBlocked(
+            dto.email, ipAddress ?? '',
+        )
+
+        if (blockCheck.blocked) {
+            // Registra tentativa bloqueada
+            await this.loginSecurityService.recordAttempt({
+                email: dto.email,
+                success: false,
+                ipAddress: ipAddress ?? '',
+                userAgent,
+                failReason: 'ACCOUNT_BLOCKED',
+            })
+            throw new UnauthorizedException(blockCheck.reason)
+        }
+
+        // 2. Busca usuário
         const user = await this.prisma.user.findUnique({
             where: { email: dto.email },
         })
 
         if (!user) {
+            await this.loginSecurityService.recordAttempt({
+                email: dto.email,
+                success: false,
+                ipAddress: ipAddress ?? '',
+                userAgent,
+                failReason: 'USER_NOT_FOUND',
+            })
             throw new UnauthorizedException('Credenciais inválidas')
         }
 
-        // 2. Verifica status
-        if (user.status !== UserStatus.ACTIVE) {
+        // 3. Verifica status
+        if (user.status === UserStatus.INACTIVE || user.status === UserStatus.SUSPENDED) {
+            await this.loginSecurityService.recordAttempt({
+                email: dto.email,
+                userId: user.id,
+                success: false,
+                ipAddress: ipAddress ?? '',
+                userAgent,
+                failReason: `ACCOUNT_${user.status}`,
+            })
             throw new UnauthorizedException('Usuário inativo ou suspenso')
         }
 
-        // 3. Valida senha
+        if (user.status === 'UNVERIFIED' as any) {
+            throw new UnauthorizedException(
+                'Email não verificado. Verifique sua caixa de entrada.',
+            )
+        }
+
+        // 4. Valida senha
         const passwordValid = await bcrypt.compare(dto.password, user.passwordHash)
 
         if (!passwordValid) {
+            await this.loginSecurityService.recordAttempt({
+                email: dto.email,
+                userId: user.id,
+                success: false,
+                ipAddress: ipAddress ?? '',
+                userAgent,
+                failReason: 'WRONG_PASSWORD',
+            })
             throw new UnauthorizedException('Credenciais inválidas')
         }
 
-        // 4. Gera tokens
+        // 5. Gera tokens
         const payload: AuthenticatedUser = {
             sub: user.id,
             email: user.email,
@@ -56,26 +106,29 @@ export class AuthService {
         }
 
         const { accessToken, refreshToken } = await this.generateTokens(payload)
-
-        // 5. Persiste hash do refresh token
         await this.saveRefreshToken(user.id, refreshToken, ipAddress, userAgent)
 
-        // 6. Atualiza último login
-        await this.prisma.user.update({
-            where: { id: user.id },
-            data: {
-                lastLoginAt: new Date(),
-                lastLoginIp: ipAddress,
-            },
-        })
+        // 6. Atualiza último login + registra sucesso
+        await Promise.all([
+            this.prisma.user.update({
+                where: { id: user.id },
+                data: { lastLoginAt: new Date(), lastLoginIp: ipAddress },
+            }),
+            this.loginSecurityService.recordAttempt({
+                email: dto.email,
+                userId: user.id,
+                success: true,
+                ipAddress: ipAddress ?? '',
+                userAgent,
+            }),
+        ])
 
         this.logger.log(`Login: ${user.email} | IP: ${ipAddress}`)
-
         return { accessToken, refreshToken, user: payload }
     }
 
     // ─────────────────────────────────────────
-    // Refresh — rotação de tokens
+    // Refresh com rotação de token
     // ─────────────────────────────────────────
     async refresh(
         userId: string,
@@ -83,51 +136,36 @@ export class AuthService {
         ipAddress?: string,
         userAgent?: string,
     ) {
-        // 1. Busca todos os refresh tokens válidos do usuário
         const storedTokens = await this.prisma.refreshToken.findMany({
-            where: {
-                userId,
-                revokedAt: null,
-                expiresAt: { gt: new Date() },
-            },
+            where: { userId, revokedAt: null, expiresAt: { gt: new Date() } },
         })
 
         if (!storedTokens.length) {
             throw new UnauthorizedException('Sessão expirada. Faça login novamente')
         }
 
-        // 2. Verifica qual token bate com o hash
-        let validTokenRecord: (typeof storedTokens)[0] | null = null
-
+        let validTokenRecord: RefreshToken | null = null
         for (const record of storedTokens) {
             const matches = await bcrypt.compare(rawRefreshToken, record.tokenHash)
-            if (matches) {
-                validTokenRecord = record
-                break
-            }
+            if (matches) { validTokenRecord = record; break }
         }
 
         if (!validTokenRecord) {
-            // Possível reutilização de token — revoga todos (ataque detectado)
             await this.revokeAllUserTokens(userId)
             this.logger.warn(`Possível reutilização de refresh token: userId=${userId}`)
             throw new UnauthorizedException('Sessão inválida. Faça login novamente')
         }
 
-        // 3. Revoga o token atual
         await this.prisma.refreshToken.update({
             where: { id: validTokenRecord.id },
             data: { revokedAt: new Date() },
         })
 
-        // 4. Busca dados atualizados do usuário
         const user = await this.prisma.user.findUnique({ where: { id: userId } })
-
         if (!user || user.status !== UserStatus.ACTIVE) {
             throw new UnauthorizedException('Usuário inativo')
         }
 
-        // 5. Gera novos tokens
         const payload: AuthenticatedUser = {
             sub: user.id,
             email: user.email,
@@ -137,15 +175,13 @@ export class AuthService {
         }
 
         const { accessToken, refreshToken } = await this.generateTokens(payload)
-
-        // 6. Persiste novo refresh token
         await this.saveRefreshToken(user.id, refreshToken, ipAddress, userAgent)
 
         return { accessToken, refreshToken }
     }
 
     // ─────────────────────────────────────────
-    // Logout — revoga o refresh token atual
+    // Logout
     // ─────────────────────────────────────────
     async logout(userId: string, rawRefreshToken: string) {
         const storedTokens = await this.prisma.refreshToken.findMany({
@@ -165,20 +201,19 @@ export class AuthService {
     }
 
     // ─────────────────────────────────────────
-    // Helpers privados
+    // Helpers
     // ─────────────────────────────────────────
     private async generateTokens(payload: AuthenticatedUser) {
         const [accessToken, refreshToken] = await Promise.all([
             this.jwtService.signAsync(payload, {
-                secret: this.configService.get('JWT_ACCESS_SECRET'),
-                expiresIn: this.configService.get('JWT_ACCESS_EXPIRES_IN', '15m'),
+                secret: this.configService.get('app.jwtAccessSecret'),
+                expiresIn: this.configService.get('app.jwtAccessExpiresIn', '15m'),
             }),
             this.jwtService.signAsync(payload, {
-                secret: this.configService.get('JWT_REFRESH_SECRET'),
-                expiresIn: this.configService.get('JWT_REFRESH_EXPIRES_IN', '7d'),
+                secret: this.configService.get('app.jwtRefreshSecret'),
+                expiresIn: this.configService.get('app.jwtRefreshExpiresIn', '7d'),
             }),
         ])
-
         return { accessToken, refreshToken }
     }
 
@@ -189,18 +224,11 @@ export class AuthService {
         userAgent?: string,
     ) {
         const tokenHash = await bcrypt.hash(rawToken, 10)
-
         const expiresAt = new Date()
-        expiresAt.setDate(expiresAt.getDate() + 7) // 7 dias
+        expiresAt.setDate(expiresAt.getDate() + 7)
 
         await this.prisma.refreshToken.create({
-            data: {
-                userId,
-                tokenHash,
-                ipAddress,
-                userAgent,
-                expiresAt,
-            },
+            data: { userId, tokenHash, ipAddress, userAgent, expiresAt },
         })
     }
 
