@@ -21,16 +21,18 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator'
 import { Roles } from '../../common/decorators/roles.decorator'
 import type { AuthenticatedUser } from '../../common/interfaces/authenticated-user.interface'
 import { ALLOWED_MIME_LIST } from './storage.constants'
+import { RateLimit } from '../../common/decorators/rate-limit.decorator'
 
 @Controller('storage')
 export class StorageController {
-  constructor(private readonly storageService: StorageService) {}
+  constructor(private readonly storageService: StorageService) { }
 
   // ─────────────────────────────────────────
   // POST /storage/upload
   // Upload de qualquer arquivo
   // ─────────────────────────────────────────
   @Post('upload')
+  @RateLimit({ limit: 30, ttl: 60, message: 'Limite de uploads atingido. Aguarde {{ttl}} segundos.' })
   @Roles(
     UserRole.SUPER_ADMIN, UserRole.COMPANY_ADMIN, UserRole.COMPANY_MANAGER,
     UserRole.TECHNICIAN, UserRole.CLIENT_ADMIN, UserRole.CLIENT_USER,
