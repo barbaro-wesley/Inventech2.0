@@ -20,6 +20,8 @@ import { ServiceOrdersModule } from './modules/service-orders/service-orders.mod
 import { MaintenanceModule } from './modules/maintenance/maintenance.module'
 import { StorageModule } from './modules/storage/storage.module'
 import { NotificationsModule } from './modules/notifications/notifications.module'
+import { DashboardModule } from './modules/dashboard/dashboard.module'
+import { HealthModule } from './modules/health/health.module'
 
 import { JwtAuthGuard } from './modules/auth/guards/jwt-auth.guard'
 import { RolesGuard } from './common/guards/roles.guard'
@@ -61,6 +63,8 @@ import { GlobalExceptionFilter } from './common/filters/http-exception.filter'
     MaintenanceModule,
     StorageModule,
     NotificationsModule,
+    DashboardModule,
+    HealthModule,
   ],
   providers: [
     // Ordem importa: JWT → RateLimit → Roles
