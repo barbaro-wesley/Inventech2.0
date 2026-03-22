@@ -22,6 +22,7 @@ import { StorageModule } from './modules/storage/storage.module'
 import { NotificationsModule } from './modules/notifications/notifications.module'
 import { DashboardModule } from './modules/dashboard/dashboard.module'
 import { HealthModule } from './modules/health/health.module'
+import { ReportsModule } from './modules/reports/reports.module'
 
 import { JwtAuthGuard } from './modules/auth/guards/jwt-auth.guard'
 import { RolesGuard } from './common/guards/roles.guard'
@@ -65,6 +66,7 @@ import { GlobalExceptionFilter } from './common/filters/http-exception.filter'
     NotificationsModule,
     DashboardModule,
     HealthModule,
+    ReportsModule,
   ],
   providers: [
     // Ordem importa: JWT → RateLimit → Roles

@@ -12,26 +12,23 @@ import { UpdateClientDto } from './dto/update-client.dto'
 import { ListClientsDto } from './dto/list-clients.dto'
 import type { AuthenticatedUser } from '../../common/interfaces/authenticated-user.interface'
 import { Prisma } from '@prisma/client'
+import { ConfigService } from '@nestjs/config' // 👈 adicionado
+
 @Injectable()
 export class ClientsService {
   private readonly logger = new Logger(ClientsService.name)
 
-  constructor(private clientsRepository: ClientsRepository) { }
+  constructor(
+    private clientsRepository: ClientsRepository,
+    private configService: ConfigService, // 👈 adicionado
+  ) { }
 
-  // ─────────────────────────────────────────
-  // Listar clientes da empresa
-  // ─────────────────────────────────────────
   async findAll(currentUser: AuthenticatedUser, filters: ListClientsDto) {
     const companyId = this.resolveCompanyId(currentUser)
     return this.clientsRepository.findMany(companyId, filters)
   }
 
-  // ─────────────────────────────────────────
-  // Buscar cliente por ID
-  // CLIENT_* só vê o próprio cliente
-  // ─────────────────────────────────────────
   async findOne(id: string, currentUser: AuthenticatedUser) {
-    // Usuários de cliente só podem ver o próprio cliente
     if (this.isClientRole(currentUser.role)) {
       if (currentUser.clientId !== id) {
         throw new ForbiddenException('Acesso negado a este cliente')
@@ -48,16 +45,11 @@ export class ClientsService {
     return client
   }
 
-  // ─────────────────────────────────────────
-  // Criar cliente
-  // Apenas empresa de manutenção cria clientes
-  // ─────────────────────────────────────────
   async create(dto: CreateClientDto, currentUser: AuthenticatedUser) {
     this.ensureCompanyRole(currentUser)
 
     const companyId = currentUser.companyId!
 
-    // Valida documento único dentro da empresa
     if (dto.document) {
       const documentTaken = await this.clientsRepository.documentExists(
         dto.document,
@@ -80,16 +72,11 @@ export class ClientsService {
       company: { connect: { id: companyId } },
     })
 
-    this.logger.log(
-      `Cliente criado: ${client.name} | Empresa: ${companyId}`,
-    )
+    this.logger.log(`Cliente criado: ${client.name} | Empresa: ${companyId}`)
 
     return client
   }
 
-  // ─────────────────────────────────────────
-  // Atualizar cliente
-  // ─────────────────────────────────────────
   async update(
     id: string,
     dto: UpdateClientDto,
@@ -104,7 +91,6 @@ export class ClientsService {
       throw new NotFoundException('Cliente não encontrado')
     }
 
-    // Valida documento único se estiver sendo alterado
     if (dto.document && dto.document !== existing.document) {
       const documentTaken = await this.clientsRepository.documentExists(
         dto.document,
@@ -130,9 +116,6 @@ export class ClientsService {
     })
   }
 
-  // ─────────────────────────────────────────
-  // Soft delete
-  // ─────────────────────────────────────────
   async remove(id: string, currentUser: AuthenticatedUser) {
     this.ensureCompanyRole(currentUser)
 
@@ -143,7 +126,6 @@ export class ClientsService {
       throw new NotFoundException('Cliente não encontrado')
     }
 
-    // Bloqueia remoção se houver equipamentos ou OS ativos
     const { _count } = existing
     if (_count.equipments > 0 || _count.serviceOrders > 0) {
       throw new ConflictException(
@@ -161,14 +143,56 @@ export class ClientsService {
   }
 
   // ─────────────────────────────────────────
+  // Upload do logo do cliente
+  // Usa URL pública — logo não precisa de expiração
+  // ─────────────────────────────────────────
+  async uploadLogo(
+    id: string,
+    file: Express.Multer.File,
+    currentUser: AuthenticatedUser,
+  ): Promise<string> {
+    await this.findOne(id, currentUser)
+
+    const ext = file.mimetype === 'image/svg+xml' ? '.svg'
+      : file.mimetype === 'image/png' ? '.png'
+        : file.mimetype === 'image/webp' ? '.webp'
+          : '.jpg'
+
+    const { Client: MinioClient } = await import('minio')
+    const minio = new MinioClient({
+      endPoint: this.configService.get<string>('minio.endpoint', 'localhost'),
+      port: this.configService.get<number>('minio.port', 9000),
+      useSSL: this.configService.get<boolean>('minio.useSSL', false),
+      accessKey: this.configService.get<string>('minio.accessKey', ''),
+      secretKey: this.configService.get<string>('minio.secretKey', ''),
+    })
+
+    const bucket = 'avatars'
+    const key = `clients-logos/${id}/logo${ext}`
+
+    await minio.putObject(bucket, key, file.buffer, file.size, {
+      'Content-Type': file.mimetype,
+    })
+
+    // ✅ URL pública direta — sem presigned, sem expiração
+    const endpoint = this.configService.get<string>('minio.endpoint', 'localhost')
+    const port = this.configService.get<number>('minio.port', 9000)
+    const useSSL = this.configService.get<boolean>('minio.useSSL', false)
+    const protocol = useSSL ? 'https' : 'http'
+    const logoUrl = `${protocol}://${endpoint}:${port}/${bucket}/${key}`
+
+    await this.clientsRepository.update(id, { logoUrl })
+
+    this.logger.log(`Logo do cliente ${id} atualizado: ${logoUrl}`)
+    return logoUrl
+  }
+
+  // ─────────────────────────────────────────
   // Helpers privados
   // ─────────────────────────────────────────
 
-  // Resolve o companyId correto baseado no papel
   private resolveCompanyId(user: AuthenticatedUser): string {
     if (user.role === UserRole.SUPER_ADMIN) {
-      // SUPER_ADMIN pode ver tudo — mas clientes são sempre
-      // listados dentro de uma empresa, então precisa de companyId
       if (!user.companyId) {
         throw new ForbiddenException(
           'SUPER_ADMIN deve informar o companyId para listar clientes',
@@ -178,30 +202,28 @@ export class ClientsService {
     return user.companyId!
   }
 
-  // Garante que é um papel da empresa de manutenção (não cliente)
   private ensureCompanyRole(user: AuthenticatedUser) {
-  const companyRoles: UserRole[] = [
-    UserRole.SUPER_ADMIN,
-    UserRole.COMPANY_ADMIN,
-    UserRole.COMPANY_MANAGER,
-  ]
-  if (!companyRoles.includes(user.role)) {
-    throw new ForbiddenException(
-      'Apenas a empresa de manutenção pode gerenciar clientes',
-    )
+    const companyRoles: UserRole[] = [
+      UserRole.SUPER_ADMIN,
+      UserRole.COMPANY_ADMIN,
+      UserRole.COMPANY_MANAGER,
+    ]
+    if (!companyRoles.includes(user.role)) {
+      throw new ForbiddenException(
+        'Apenas a empresa de manutenção pode gerenciar clientes',
+      )
+    }
+    if (!user.companyId) {
+      throw new ForbiddenException('Acesso sem escopo de empresa')
+    }
   }
-  if (!user.companyId) {
-    throw new ForbiddenException('Acesso sem escopo de empresa')
-  }
-}
 
-  // Verifica se o papel é de usuário de cliente
   private isClientRole(role: UserRole): boolean {
-  const clientRoles: UserRole[] = [
-    UserRole.CLIENT_ADMIN,
-    UserRole.CLIENT_USER,
-    UserRole.CLIENT_VIEWER,
-  ]
-  return clientRoles.includes(role)
-}
+    const clientRoles: UserRole[] = [
+      UserRole.CLIENT_ADMIN,
+      UserRole.CLIENT_USER,
+      UserRole.CLIENT_VIEWER,
+    ]
+    return clientRoles.includes(role)
+  }
 }

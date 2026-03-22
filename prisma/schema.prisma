@@ -4,7 +4,6 @@
 
 generator client {
   provider = "prisma-client-js"
-  previewFeatures = ["driverAdapters"]
 }
 
 datasource db {
@@ -142,6 +141,17 @@ enum AttachmentEntity {
   COMMENT
 }
 
+enum ReportType {
+  SERVICE_ORDERS
+  EQUIPMENT
+  PREVENTIVE
+  TECHNICIANS
+  FINANCIAL
+}
+
+// Permissões de relatório por empresa — quais roles acessam cada tipo
+// Configurado pelo COMPANY_ADMIN no painel de administração
+
 enum TwoFactorType {
   LOGIN
   EMAIL_CHANGE
@@ -177,6 +187,11 @@ model Company {
   email       String?
   phone       String?
   logoUrl     String?       @map("logo_url")
+  // Configurações de relatório
+  reportPrimaryColor   String?  @default("#1E40AF") @map("report_primary_color")
+  reportSecondaryColor String?  @default("#DBEAFE") @map("report_secondary_color")
+  reportHeaderTitle    String?  @map("report_header_title")  // Ex: "Relatório Técnico"
+  reportFooterText     String?  @map("report_footer_text")   // Ex: "Documento confidencial"
   status      CompanyStatus @default(ACTIVE)
   trialEndsAt DateTime?     @map("trial_ends_at")
   settings    Json?
@@ -189,6 +204,7 @@ model Company {
   clients           Client[]
   users             User[]
   maintenanceGroups MaintenanceGroup[]
+  reportPermissions ReportPermission[]
 
   @@index([platformId])
   @@index([slug])
@@ -208,6 +224,8 @@ model Client {
   email     String?
   phone     String?
   address   Json?
+  logoUrl   String?      @map("logo_url")       // Logo do cliente para relatórios
+  reportName String?     @map("report_name")     // Nome que aparece nos relatórios
   status    ClientStatus @default(ACTIVE)
   settings  Json?
   createdAt DateTime     @default(now()) @map("created_at")
@@ -810,6 +828,26 @@ model Notification {
   @@index([status, createdAt])
   @@index([companyId, createdAt])
   @@map("notifications")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REPORT PERMISSION — controle de acesso por tipo de relatório
+// ─────────────────────────────────────────────────────────────────────────────
+
+model ReportPermission {
+  id         String     @id @default(uuid())
+  companyId  String     @map("company_id")
+  reportType ReportType @map("report_type")
+  // Roles que têm acesso — ex: ["COMPANY_ADMIN", "COMPANY_MANAGER"]
+  allowedRoles String[] @map("allowed_roles")
+  createdAt  DateTime   @default(now()) @map("created_at")
+  updatedAt  DateTime   @updatedAt @map("updated_at")
+
+  company Company @relation(fields: [companyId], references: [id])
+
+  @@unique([companyId, reportType])
+  @@index([companyId])
+  @@map("report_permissions")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

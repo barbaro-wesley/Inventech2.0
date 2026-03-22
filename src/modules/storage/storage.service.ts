@@ -30,6 +30,9 @@ export interface UploadedFile {
   size: number
 }
 
+// Buckets com leitura pública (avatars e logos)
+const PUBLIC_BUCKETS = ['avatars']
+
 @Injectable()
 export class StorageService implements OnModuleInit {
   private readonly logger = new Logger(StorageService.name)
@@ -39,7 +42,7 @@ export class StorageService implements OnModuleInit {
   constructor(
     private configService: ConfigService,
     private prisma: PrismaService,
-  ) {}
+  ) { }
 
   async onModuleInit() {
     this.client = new Minio.Client({
@@ -64,23 +67,12 @@ export class StorageService implements OnModuleInit {
     clientId: string | null,
     currentUser: AuthenticatedUser,
   ) {
-    // 1. Valida tipo MIME
     this.validateMimeType(file.mimetype)
-
-    // 2. Valida tamanho
     this.validateFileSize(file.mimetype, file.size)
-
-    // 3. Valida que a entidade existe e pertence ao tenant
     await this.validateEntityOwnership(dto.entity, dto.entityId, companyId, clientId)
 
-    // 4. Determina o bucket
     const bucket = ENTITY_BUCKET_MAP[dto.entity]
-
-    // 5. Gera key hierárquica no MinIO
     const key = this.buildKey(dto.entity, dto.entityId, file.originalname, companyId, clientId)
-
-    // 6. Faz upload para o MinIO
-    const mimeInfo = ALLOWED_MIME_TYPES[file.mimetype as keyof typeof ALLOWED_MIME_TYPES]
 
     await this.client.putObject(bucket, key, file.buffer, file.size, {
       'Content-Type': file.mimetype,
@@ -90,7 +82,6 @@ export class StorageService implements OnModuleInit {
       'x-amz-meta-entity-id': dto.entityId,
     })
 
-    // 7. Salva o registro no banco
     const attachment = await this.prisma.attachment.create({
       data: {
         companyId,
@@ -103,7 +94,6 @@ export class StorageService implements OnModuleInit {
         mimeType: file.mimetype,
         sizeBytes: file.size,
         uploadedById: currentUser.sub,
-        // FK específica por entidade
         ...(dto.entity === AttachmentEntity.SERVICE_ORDER && { serviceOrderId: dto.entityId }),
         ...(dto.entity === AttachmentEntity.MAINTENANCE && { maintenanceId: dto.entityId }),
         ...(dto.entity === AttachmentEntity.EQUIPMENT && { equipmentId: dto.entityId }),
@@ -123,8 +113,7 @@ export class StorageService implements OnModuleInit {
     })
 
     this.logger.log(
-      `Upload: ${file.originalname} (${this.formatSize(file.size)}) ` +
-      `→ ${bucket}/${key}`,
+      `Upload: ${file.originalname} (${this.formatSize(file.size)}) → ${bucket}/${key}`,
     )
 
     return attachment
@@ -156,12 +145,10 @@ export class StorageService implements OnModuleInit {
       throw new NotFoundException('Arquivo não encontrado')
     }
 
-    // Gera URL pré-assinada — o frontend acessa o MinIO diretamente
     const url = await this.client.presignedGetObject(
       attachment.bucket,
       attachment.key,
       expiresIn,
-      // Headers para forçar download com o nome original
       {
         'response-content-disposition': `inline; filename="${encodeURIComponent(attachment.fileName)}"`,
         'response-content-type': attachment.mimeType,
@@ -227,7 +214,6 @@ export class StorageService implements OnModuleInit {
       throw new NotFoundException('Arquivo não encontrado')
     }
 
-    // Só quem fez o upload ou admin pode deletar
     const canDelete =
       attachment.uploadedById === currentUser.sub ||
       ['SUPER_ADMIN', 'COMPANY_ADMIN', 'COMPANY_MANAGER'].includes(currentUser.role)
@@ -236,10 +222,7 @@ export class StorageService implements OnModuleInit {
       throw new ForbiddenException('Você não tem permissão para deletar este arquivo')
     }
 
-    // Remove do MinIO
     await this.client.removeObject(attachment.bucket, attachment.key)
-
-    // Remove do banco
     await this.prisma.attachment.delete({ where: { id: attachmentId } })
 
     this.logger.log(`Arquivo deletado: ${attachment.fileName} (${attachment.key})`)
@@ -249,9 +232,9 @@ export class StorageService implements OnModuleInit {
 
   // ─────────────────────────────────────────
   // Upload de avatar de usuário
+  // Usa URL pública — avatar não precisa de expiração
   // ─────────────────────────────────────────
   async uploadAvatar(file: UploadedFile, userId: string) {
-    // Avatar só aceita imagens
     if (!file.mimetype.startsWith('image/')) {
       throw new BadRequestException('Avatar deve ser uma imagem (JPG, PNG ou WebP)')
     }
@@ -262,7 +245,6 @@ export class StorageService implements OnModuleInit {
     const ext = ALLOWED_MIME_TYPES[file.mimetype as keyof typeof ALLOWED_MIME_TYPES]?.ext ?? '.jpg'
     const key = `${userId}/avatar${ext}`
 
-    // Remove avatar anterior se existir
     try {
       await this.client.removeObject(bucket, key)
     } catch {
@@ -273,16 +255,26 @@ export class StorageService implements OnModuleInit {
       'Content-Type': file.mimetype,
     })
 
-    // Gera URL pública para o avatar
-    const url = await this.client.presignedGetObject(bucket, key, PRESIGNED_URL_TTL)
+    // ✅ URL pública direta — bucket avatars é público
+    const url = this.buildPublicUrl(bucket, key)
 
-    // Atualiza o avatarUrl no usuário
     await this.prisma.user.update({
       where: { id: userId },
       data: { avatarUrl: url },
     })
 
     return { avatarUrl: url }
+  }
+
+  // ─────────────────────────────────────────
+  // Monta URL pública para buckets públicos
+  // ─────────────────────────────────────────
+  buildPublicUrl(bucket: string, key: string): string {
+    const endpoint = this.configService.get<string>('minio.endpoint', 'localhost')
+    const port = this.configService.get<number>('minio.port', 9000)
+    const useSSL = this.configService.get<boolean>('minio.useSSL', false)
+    const protocol = useSSL ? 'https' : 'http'
+    return `${protocol}://${endpoint}:${port}/${bucket}/${key}`
   }
 
   // ─────────────────────────────────────────
@@ -313,8 +305,6 @@ export class StorageService implements OnModuleInit {
     return ALLOWED_MIME_TYPES[mimeType as keyof typeof ALLOWED_MIME_TYPES]?.category ?? 'default'
   }
 
-  // Chave hierárquica no MinIO
-  // Ex: uuid-company/uuid-client/uuid-entity/uuid-filename.pdf
   private buildKey(
     entity: AttachmentEntity,
     entityId: string,
@@ -357,7 +347,6 @@ export class StorageService implements OnModuleInit {
     }
   }
 
-  // Valida que a entidade existe e pertence ao tenant correto
   private async validateEntityOwnership(
     entity: AttachmentEntity,
     entityId: string,
@@ -387,7 +376,7 @@ export class StorageService implements OnModuleInit {
         where: { id: entityId },
         select: { id: true },
       }),
-      AVATAR: async () => ({ id: entityId }), // Avatar não precisa de validação de entidade
+      AVATAR: async () => ({ id: entityId }),
     }
 
     const check = checks[entity]
@@ -401,7 +390,10 @@ export class StorageService implements OnModuleInit {
     }
   }
 
-  // Garante que todos os buckets existem no MinIO
+  // ─────────────────────────────────────────
+  // Garante que todos os buckets existem
+  // e aplica política pública nos buckets de avatar/logo
+  // ─────────────────────────────────────────
   private async ensureBucketsExist() {
     const buckets = [
       'equipment-attachments',
@@ -417,7 +409,30 @@ export class StorageService implements OnModuleInit {
         await this.client.makeBucket(bucket, 'us-east-1')
         this.logger.log(`Bucket criado: ${bucket}`)
       }
+
+      // ✅ Aplica política pública de leitura nos buckets públicos
+      if (PUBLIC_BUCKETS.includes(bucket)) {
+        await this.setBucketPublicReadPolicy(bucket)
+      }
     }
+  }
+
+  // Política S3 que permite leitura pública de qualquer objeto no bucket
+  private async setBucketPublicReadPolicy(bucket: string) {
+    const policy = JSON.stringify({
+      Version: '2012-10-17',
+      Statement: [
+        {
+          Effect: 'Allow',
+          Principal: { AWS: ['*'] },
+          Action: ['s3:GetObject'],
+          Resource: [`arn:aws:s3:::${bucket}/*`],
+        },
+      ],
+    })
+
+    await this.client.setBucketPolicy(bucket, policy)
+    this.logger.log(`Política pública aplicada no bucket: ${bucket}`)
   }
 
   private formatSize(bytes: number): string {
