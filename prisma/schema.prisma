@@ -205,7 +205,10 @@ model Company {
   users             User[]
   maintenanceGroups MaintenanceGroup[]
   reportPermissions ReportPermission[]
-
+  licenseExpiresAt  DateTime?   // data de vencimento do contrato
+  suspendedAt       DateTime?   // quando foi suspenso
+  suspendedReason   String?     // motivo do bloqueio
+  suspendedBy       String?     // ID do SUPER_ADMIN que bloqueou
   @@index([platformId])
   @@index([slug])
   @@index([status])

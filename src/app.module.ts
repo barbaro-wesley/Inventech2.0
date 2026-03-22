@@ -53,6 +53,7 @@ import { GlobalExceptionFilter } from './common/filters/http-exception.filter'
       inject: [ConfigService],
     }),
 
+    // PrismaModule é @Global() — disponível em todos os módulos
     PrismaModule,
     AuthModule,
     UsersModule,
@@ -69,10 +70,14 @@ import { GlobalExceptionFilter } from './common/filters/http-exception.filter'
     ReportsModule,
   ],
   providers: [
-    // Ordem importa: JWT → RateLimit → Roles
+    // ─── Ordem dos guards é crítica ──────────────────────────────
+    // 1. JWT autentica e popula request.user
     { provide: APP_GUARD, useClass: JwtAuthGuard },
+    // 2. Rate limit (não depende de request.user)
     { provide: APP_GUARD, useClass: RateLimitGuard },
+    // 4. Roles guard (depende de request.user do passo 1)
     { provide: APP_GUARD, useClass: RolesGuard },
+    // ─── Filtro global de exceções ────────────────────────────────
     { provide: APP_FILTER, useClass: GlobalExceptionFilter },
   ],
 })

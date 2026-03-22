@@ -14,10 +14,10 @@ import { UpdateCompanyDto } from './dto/update-company.dto'
 import { ListCompaniesDto } from './dto/list-companies.dto'
 import { CurrentUser } from '../../common/decorators/current-user.decorator'
 import { Roles } from '../../common/decorators/roles.decorator'
-import type { AuthenticatedUser } from '../../common/interfaces/authenticated-user.interface'
+import type  { AuthenticatedUser } from '../../common/interfaces/authenticated-user.interface'
 import { StorageService } from '../storage/storage.service'
+import { LicenseService, SuspendCompanyDto, SetLicenseDto, SetTrialDto } from './license.service'
 import { UpdateReportSettingsDto } from './dto/update-report-settings.dto'
-
 @ApiTags('Companies')
 @ApiBearerAuth('JWT')
 @Controller('companies')
@@ -25,7 +25,8 @@ export class CompaniesController {
   constructor(
     private readonly companiesService: CompaniesService,
     private readonly storageService: StorageService,
-  ) { }
+    private readonly licenseService: LicenseService,
+  ) {}
 
   @Get()
   @Roles(UserRole.SUPER_ADMIN)
@@ -109,6 +110,90 @@ export class CompaniesController {
     @CurrentUser() currentUser: AuthenticatedUser,
   ) {
     return this.companiesService.updateReportSettings(id, dto, currentUser)
+  }
+
+  // ─────────────────────────────────────────
+  // GET /companies/:id/license
+  // ─────────────────────────────────────────
+  @Get(':id/license')
+  @ApiOperation({ summary: 'Status da licença', description: 'Retorna status detalhado da licença, dias até vencimento e alertas.' })
+  @Roles(UserRole.SUPER_ADMIN)
+  getLicenseStatus(@Param('id', ParseUUIDPipe) id: string) {
+    return this.licenseService.getLicenseStatus(id)
+  }
+
+  // GET /companies/licenses — painel geral de licenças
+  @Get('licenses/all')
+  @ApiOperation({ summary: 'Painel de licenças', description: 'Lista todas as empresas com status de licença. Filtros: status, expiringInDays.' })
+  @Roles(UserRole.SUPER_ADMIN)
+  listLicenses(
+    @Query('status') status?: string,
+    @Query('expiringInDays') expiringInDays?: string,
+  ) {
+    return this.licenseService.listLicenses({
+      status,
+      expiringInDays: expiringInDays ? parseInt(expiringInDays) : undefined,
+    })
+  }
+
+  // PATCH /companies/:id/suspend
+  @Patch(':id/suspend')
+  @ApiOperation({
+    summary: 'Suspender empresa',
+    description: 'Bloqueia o acesso de todos os usuários da empresa imediatamente. Requer motivo.',
+  })
+  @Roles(UserRole.SUPER_ADMIN)
+  @HttpCode(HttpStatus.OK)
+  suspend(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: SuspendCompanyDto,
+    @CurrentUser() cu: AuthenticatedUser,
+  ) {
+    return this.licenseService.suspend(id, dto.reason, cu.sub)
+  }
+
+  // PATCH /companies/:id/activate
+  @Patch(':id/activate')
+  @ApiOperation({
+    summary: 'Reativar empresa',
+    description: 'Restaura o acesso da empresa. Limpa a suspensão e invalida o cache imediatamente.',
+  })
+  @Roles(UserRole.SUPER_ADMIN)
+  @HttpCode(HttpStatus.OK)
+  activate(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() cu: AuthenticatedUser,
+  ) {
+    return this.licenseService.activate(id, cu.sub)
+  }
+
+  // PATCH /companies/:id/license
+  @Patch(':id/license')
+  @ApiOperation({
+    summary: 'Definir/renovar licença',
+    description: 'Define a data de vencimento do contrato. Se a empresa estava suspensa por vencimento, reativa automaticamente.',
+  })
+  @Roles(UserRole.SUPER_ADMIN)
+  @HttpCode(HttpStatus.OK)
+  setLicense(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: SetLicenseDto,
+    @CurrentUser() cu: AuthenticatedUser,
+  ) {
+    return this.licenseService.setLicense(id, dto, cu.sub)
+  }
+
+  // PATCH /companies/:id/trial
+  @Patch(':id/trial')
+  @ApiOperation({ summary: 'Configurar período de teste' })
+  @Roles(UserRole.SUPER_ADMIN)
+  @HttpCode(HttpStatus.OK)
+  setTrial(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: SetTrialDto,
+    @CurrentUser() cu: AuthenticatedUser,
+  ) {
+    return this.licenseService.setTrial(id, dto, cu.sub)
   }
 
   @Delete(':id')

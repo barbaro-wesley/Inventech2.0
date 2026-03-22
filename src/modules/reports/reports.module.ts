@@ -1,11 +1,13 @@
 import { Module } from '@nestjs/common'
 import { ReportsService } from './reports.service'
 import { ReportsController } from './reports.controller'
+import { ReportPermissionsService } from './report-permissions.service'
 import { CompaniesModule } from '../companies/companies.module'
 
 @Module({
-  imports: [CompaniesModule], // Para buscar logo e cores da empresa
+  imports: [CompaniesModule],
   controllers: [ReportsController],
-  providers: [ReportsService],
+  providers: [ReportsService, ReportPermissionsService],
+  exports: [ReportPermissionsService],
 })
 export class ReportsModule { }

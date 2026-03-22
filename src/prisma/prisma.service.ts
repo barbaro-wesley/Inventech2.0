@@ -200,4 +200,5 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
 
   get attachment() { return this._db.attachment }
   get notification() { return this._db.notification }
+  get reportPermission() { return this._db.reportPermission }
 }
