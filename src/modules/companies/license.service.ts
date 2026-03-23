@@ -46,36 +46,40 @@ export class LicenseService {
       throw new BadRequestException('Empresa já está suspensa')
     }
 
-    // Suspende a empresa e todos os usuários em transação
-    const result = await this.prisma.$transaction(async (tx) => {
-      await tx.company.update({
-        where: { id: companyId },
-        data: {
-          status: CompanyStatus.SUSPENDED,
-          suspendedAt: new Date(),
-          suspendedReason: reason,
-          suspendedBy: adminId,
-        },
-      })
+    const now = new Date()
 
-      // Bloqueia todos os usuários ativos da empresa (exceto SUPER_ADMIN)
-      const { count } = await tx.user.updateMany({
-        where: {
-          companyId,
-          status: { in: [UserStatus.ACTIVE, UserStatus.UNVERIFIED] },
-          deletedAt: null,
-        },
-        data: { status: UserStatus.SUSPENDED },
-      })
-
-      // Revoga todos os refresh tokens ativos (força logout imediato)
-      await tx.refreshToken.updateMany({
-        where: { user: { companyId }, revokedAt: null },
-        data: { revokedAt: new Date() },
-      })
-
-      return count
+    // Suspende a empresa
+    await this.prisma.company.update({
+      where: { id: companyId },
+      data: {
+        status: CompanyStatus.SUSPENDED,
+        suspendedAt: now,
+        suspendedReason: reason,
+        suspendedBy: adminId,
+      },
     })
+
+    // Bloqueia todos os usuários da empresa via raw SQL
+    // (evita interceptação do middleware de soft delete)
+    const updateResult = await this.prisma.$executeRaw`
+      UPDATE users
+      SET status = 'SUSPENDED', updated_at = NOW()
+      WHERE company_id = ${companyId}
+        AND status IN ('ACTIVE', 'UNVERIFIED')
+        AND deleted_at IS NULL
+    `
+
+    // Revoga todos os refresh tokens via raw SQL
+    await this.prisma.$executeRaw`
+      UPDATE refresh_tokens
+      SET revoked_at = NOW()
+      WHERE user_id IN (
+        SELECT id FROM users WHERE company_id = ${companyId}
+      )
+      AND revoked_at IS NULL
+    `
+
+    const result = updateResult
 
     this.logger.warn(
       `Empresa suspensa: ${company.name} (${companyId}) | ` +
@@ -99,31 +103,25 @@ export class LicenseService {
       throw new BadRequestException('Empresa já está ativa')
     }
 
-    // Reativa a empresa e todos os usuários suspensos pela empresa
-    const result = await this.prisma.$transaction(async (tx) => {
-      await tx.company.update({
-        where: { id: companyId },
-        data: {
-          status: CompanyStatus.ACTIVE,
-          suspendedAt: null,
-          suspendedReason: null,
-          suspendedBy: null,
-        },
-      })
-
-      // Reativa apenas usuários que foram suspensos (não os bloqueados por tentativas)
-      // Usamos suspendedBy da empresa como referência — todos suspensos pela empresa voltam
-      const { count } = await tx.user.updateMany({
-        where: {
-          companyId,
-          status: UserStatus.SUSPENDED,
-          deletedAt: null,
-        },
-        data: { status: UserStatus.ACTIVE },
-      })
-
-      return count
+    // Reativa a empresa
+    await this.prisma.company.update({
+      where: { id: companyId },
+      data: {
+        status: CompanyStatus.ACTIVE,
+        suspendedAt: null,
+        suspendedReason: null,
+        suspendedBy: null,
+      },
     })
+
+    // Reativa todos os usuários suspensos via raw SQL
+    const result = await this.prisma.$executeRaw`
+      UPDATE users
+      SET status = 'ACTIVE', updated_at = NOW()
+      WHERE company_id = ${companyId}
+        AND status = 'SUSPENDED'
+        AND deleted_at IS NULL
+    `
 
     this.logger.log(
       `Empresa reativada: ${company.name} (${companyId}) | ` +
@@ -340,21 +338,21 @@ export class LicenseService {
           },
         })
 
-        // Bloqueia todos os usuários da empresa
-        await tx.user.updateMany({
-          where: {
-            companyId: company.id,
-            status: { in: [UserStatus.ACTIVE, UserStatus.UNVERIFIED] },
-            deletedAt: null,
-          },
-          data: { status: UserStatus.SUSPENDED },
-        })
+        // Bloqueia todos os usuários da empresa via raw SQL
+        await tx.$executeRaw`
+          UPDATE users
+          SET status = 'SUSPENDED', updated_at = NOW()
+          WHERE company_id = ${company.id}
+            AND status IN ('ACTIVE', 'UNVERIFIED')
+            AND deleted_at IS NULL
+        `
 
         // Revoga refresh tokens
-        await tx.refreshToken.updateMany({
-          where: { user: { companyId: company.id }, revokedAt: null },
-          data: { revokedAt: now },
-        })
+        await tx.$executeRaw`
+          UPDATE refresh_tokens SET revoked_at = NOW()
+          WHERE user_id IN (SELECT id FROM users WHERE company_id = ${company.id})
+          AND revoked_at IS NULL
+        `
       })
       this.logger.warn(`Auto-suspenso: ${company.name} | ${company.reason}`)
     }
